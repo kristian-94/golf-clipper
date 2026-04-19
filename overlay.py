@@ -27,7 +27,10 @@ PAD_X = 24
 PAD_Y = 18
 ROW_GAP = 8
 HEADER_GAP = 14
-WIDTH = 260  # fixed; height grows with player count
+WIDTH = 260  # scoreboard column; total card width grows when a map is added
+
+# Hole-map layout (only used when render_card receives `hole_map`)
+MAP_PAD = 8          # gutter between map and scoreboard
 
 # Colors (RGBA)
 BG       = (14, 17, 22, 215)        # near-black, ~85% opaque
@@ -62,11 +65,16 @@ def render_card(
     par: int,
     players: list[dict],
     shot: tuple[int, int] | None = None,
+    hole_map: Image.Image | None = None,
 ) -> Image.Image:
     """Build a transparent RGBA card. `players` is leaderboard-ordered.
 
     `shot` is an optional (index, total) tuple — only set when clip count
     for the hole matched the owner's strokes for that hole.
+
+    `hole_map` is an optional pre-rendered RGBA image of the hole geometry
+    (from `course_map.render_hole_map`). When supplied, it's composited as a
+    column on the left of the scoreboard and the card grows accordingly.
     """
     f_header = _font(22, bold=True)
     f_meta   = _font(14, bold=False)
@@ -82,7 +90,7 @@ def render_card(
 
     header_h = text_h(f_header)
     row_h    = max(text_h(f_name), text_h(f_score))
-    height = (
+    sb_height = (
         PAD_Y
         + header_h
         + HEADER_GAP
@@ -91,22 +99,39 @@ def render_card(
         + PAD_Y
     )
 
-    img = Image.new("RGBA", (WIDTH, height), (0, 0, 0, 0))
+    # Map column width is just the map's width + a small gap to the scoreboard.
+    # No box around the map — it floats freely on the left.
+    map_col_w = (hole_map.width + MAP_PAD) if hole_map else 0
+    total_w = map_col_w + WIDTH
+    # Total card height fits whichever is taller — the scoreboard box or the map.
+    total_h = max(sb_height, hole_map.height) if hole_map else sb_height
+
+    img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+
+    sb_left = map_col_w
+    sb_right = total_w
+    sb_top = 0  # scoreboard anchored to the top — the card itself is top-right pinned
+
+    # Box wraps the scoreboard column only — the map is unboxed.
     draw.rounded_rectangle(
-        (0, 0, WIDTH - 1, height - 1),
+        (sb_left, sb_top, sb_right - 1, sb_top + sb_height - 1),
         radius=RADIUS, fill=BG, outline=BORDER, width=1,
     )
 
-    bar_top = PAD_Y - 2
-    bar_bot = PAD_Y + header_h + 2
+    if hole_map:
+        # Top-align the map with the scoreboard so the visual top edge is shared.
+        img.paste(hole_map, (0, 0), hole_map)
+
+    bar_top = sb_top + PAD_Y - 2
+    bar_bot = sb_top + PAD_Y + header_h + 2
     draw.rounded_rectangle(
-        (PAD_X - 10, bar_top, PAD_X - 6, bar_bot),
+        (sb_left + PAD_X - 10, bar_top, sb_left + PAD_X - 6, bar_bot),
         radius=2, fill=ACCENT,
     )
 
-    y = PAD_Y
-    head_left = PAD_X
+    y = sb_top + PAD_Y
+    head_left = sb_left + PAD_X
     draw.text((head_left, y), f"HOLE {hole}", font=f_header, fill=TEXT)
     hole_w = draw.textlength(f"HOLE {hole}", font=f_header)
     sep = "   ·   "
@@ -117,20 +142,20 @@ def render_card(
         idx, total = shot
         tag = f"SHOT {idx}/{total}"
         tag_w = draw.textlength(tag, font=f_meta)
-        draw.text((WIDTH - PAD_X - tag_w, y + 4), tag, font=f_meta, fill=MUTED)
+        draw.text((sb_right - PAD_X - tag_w, y + 4), tag, font=f_meta, fill=MUTED)
 
     y += header_h + HEADER_GAP // 2
-    draw.line((PAD_X, y, WIDTH - PAD_X, y), fill=BORDER, width=1)
+    draw.line((sb_left + PAD_X, y, sb_right - PAD_X, y), fill=BORDER, width=1)
     y += HEADER_GAP // 2
 
     for i, p in enumerate(players):
         if i:
             y += ROW_GAP
         name_color = OWNER if p.get("is_owner") else TEXT
-        draw.text((PAD_X, y), p["name"], font=f_name, fill=name_color)
+        draw.text((sb_left + PAD_X, y), p["name"], font=f_name, fill=name_color)
         score = str(p["total"])
         score_w = draw.textlength(score, font=f_score)
-        draw.text((WIDTH - PAD_X - score_w, y - 2), score, font=f_score, fill=name_color)
+        draw.text((sb_right - PAD_X - score_w, y - 2), score, font=f_score, fill=name_color)
         y += row_h
 
     return img

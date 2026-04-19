@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy", "scipy", "soundfile", "pillow"]
+# dependencies = ["numpy", "scipy", "soundfile", "pillow", "httpx"]
 # ///
 """Batch-trim every video in a round folder.
 
@@ -45,6 +45,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from course_map import extract_gps, load_course_geom, render_hole_map
 from impact_trim import SR, assess, extract_audio, find_impacts
 from overlay import render_card, render_video
 
@@ -98,25 +99,38 @@ def probe_recorded_at(src: Path) -> str | None:
 
 
 def ensure_recorded_at(meta_dir: Path, raw_dir: Path) -> int:
-    """Backfill `recorded_at` on existing sidecars that don't have it.
+    """Backfill `recorded_at` and `gps`/`gps_accuracy` on older sidecars.
 
     Returns the count of sidecars updated. Safe to call repeatedly.
     """
     n = 0
     for meta_path in sorted(meta_dir.glob("*.json")):
         data = json.loads(meta_path.read_text())
-        if data.get("recorded_at"):
-            continue
-        src = raw_dir / data["raw"]
-        if not src.exists():
-            continue
-        ts = probe_recorded_at(src)
-        data["recorded_at"] = ts
-        if ts is None:
-            data["flagged"] = True
-            data.setdefault("reasons", []).append("no creation_time in container metadata")
-        meta_path.write_text(json.dumps(data, indent=2))
-        n += 1
+        changed = False
+
+        if not data.get("recorded_at"):
+            src = raw_dir / data["raw"]
+            if src.exists():
+                ts = probe_recorded_at(src)
+                data["recorded_at"] = ts
+                if ts is None:
+                    data["flagged"] = True
+                    data.setdefault("reasons", []).append(
+                        "no creation_time in container metadata")
+                changed = True
+
+        # GPS field absent (sidecar predates the map feature).
+        if "gps" not in data:
+            src = raw_dir / data["raw"]
+            if src.exists():
+                gps, acc = extract_gps(src)
+                data["gps"] = list(gps) if gps else None
+                data["gps_accuracy"] = acc
+                changed = True
+
+        if changed:
+            meta_path.write_text(json.dumps(data, indent=2))
+            n += 1
     return n
 
 
@@ -139,11 +153,14 @@ def detect_clip(
     audio = extract_audio(src)
     cands = find_impacts(audio, SR)
     recorded_at = probe_recorded_at(src)
+    gps, gps_acc = extract_gps(src)
 
     if not cands:
         data = {
             "raw": src.name,
             "recorded_at": recorded_at,
+            "gps": list(gps) if gps else None,
+            "gps_accuracy": gps_acc,
             "impact_s": None,
             "pre": pre,
             "post": post,
@@ -169,6 +186,8 @@ def detect_clip(
     data = {
         "raw": src.name,
         "recorded_at": recorded_at,
+        "gps": list(gps) if gps else None,
+        "gps_accuracy": gps_acc,
         "impact_s": best.time_s,
         "pre": pre,
         "post": post,
@@ -182,14 +201,30 @@ def detect_clip(
     return data
 
 
-def _card_for(data: dict):
-    """Build the overlay card from sidecar fields, or None if not enough info."""
+def _card_for(data: dict, course_geom: dict | None = None):
+    """Build the overlay card from sidecar fields, or None if not enough info.
+
+    `course_geom` is optional — when present and the hole has OSM geometry,
+    a small map is composited on the left of the scorecard.
+    """
     if data.get("hole") is None or not data.get("players"):
         return None
     shot = None
     if data.get("shot_index") and data.get("shot_total"):
         shot = (data["shot_index"], data["shot_total"])
-    return render_card(data["hole"], data["par"], data["players"], shot=shot)
+
+    hole_map = None
+    if course_geom is not None:
+        gps = data.get("gps")
+        gps_tuple = (gps[0], gps[1]) if gps else None
+        hole_map = render_hole_map(
+            course_geom, data["hole"], gps_tuple, data.get("gps_accuracy"),
+        )
+
+    return render_card(
+        data["hole"], data["par"], data["players"],
+        shot=shot, hole_map=hole_map,
+    )
 
 
 def render_from_sidecar(meta_path: Path, raw_dir: Path, trims_dir: Path) -> str:
@@ -206,7 +241,10 @@ def render_from_sidecar(meta_path: Path, raw_dir: Path, trims_dir: Path) -> str:
     dst = trims_dir / f"{meta_path.stem}.mp4"
     start = max(0.0, data["impact_s"] - data["pre"])
     duration = data["pre"] + data["post"]
-    render_video(src, start, duration, dst, card=_card_for(data))
+    # Round dir is the meta dir's parent; course geom is optional.
+    course_geom = load_course_geom(meta_path.parent.parent)
+    render_video(src, start, duration, dst,
+                 card=_card_for(data, course_geom=course_geom))
     data["trimmed_at"] = datetime.now().isoformat(timespec="seconds")
     meta_path.write_text(json.dumps(data, indent=2))
     return "ok"

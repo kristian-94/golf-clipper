@@ -9,5 +9,8 @@ __pycache__/
 *.pyc
 .venv/
 
+# Scratch / preview renders
+tmp/
+
 # macOS
 .DS_Store
