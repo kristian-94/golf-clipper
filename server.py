@@ -3,6 +3,7 @@
 # dependencies = [
 #   "fastapi", "uvicorn", "pydantic",
 #   "numpy", "scipy", "soundfile", "pillow",
+#   "httpx",
 # ]
 # ///
 """Web UI for reviewing/adjusting golf clip trims.
