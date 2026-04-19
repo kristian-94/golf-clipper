@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Golf clipper</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --line: #2a313c;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --strong: #2ea043;
+    --ok: #c9a227;
+    --weak: #d1242f;
+    --pending: #6e7681;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+               font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 10px 16px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header .meta { color: var(--muted); }
+  header .filters { margin-left: auto; display: flex; gap: 6px; }
+  .filter-btn {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 10px; cursor: pointer; font-size: 12px;
+  }
+  .filter-btn.active { background: var(--accent); color: #0e1116; border-color: var(--accent); }
+  main { padding: 16px; }
+  .grid {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  }
+  .tile {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; overflow: hidden;
+    cursor: pointer; transition: transform 0.08s, border-color 0.08s;
+    display: flex; flex-direction: column;
+  }
+  .tile:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .tile.flagged { border-color: var(--weak); }
+  .tile.needs_fix { box-shadow: inset 0 0 0 3px var(--weak); }
+  .tile.needs_fix::after {
+    content: "✕"; position: absolute; top: 8px; right: 8px;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--weak); color: #fff; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: none;
+  }
+  .tile.approved { opacity: 0.55; }
+  .tile { position: relative; }
+  .edit-btn, .trash-btn {
+    background: rgba(22,27,34,0.85); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px;
+    width: 28px; height: 24px; padding: 0; cursor: pointer;
+    font-size: 13px; line-height: 1;
+  }
+  .edit-btn:hover { background: var(--accent); color: #0e1116; }
+  .trash-btn:hover { background: var(--weak); color: #fff; border-color: var(--weak); }
+  .tile .slot { width: 100%; aspect-ratio: 16 / 9; background: #000; display: block; }
+  .tile video, .tile .placeholder {
+    width: 100%; height: 100%; background: #000; display: block;
+    object-fit: cover;
+  }
+  .tile .placeholder {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 12px;
+  }
+  .tile .meta {
+    padding: 8px 10px;
+    display: flex; align-items: center; gap: 8px;
+    border-top: 1px solid var(--line);
+  }
+  .tile .name {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12px; color: var(--muted);
+  }
+  .chip {
+    font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .chip.strong  { background: rgba(46,160,67,0.15); color: var(--strong); }
+  .chip.ok      { background: rgba(201,162,39,0.15); color: var(--ok); }
+  .chip.weak    { background: rgba(209,36,47,0.15); color: var(--weak); }
+  .chip.pending { background: rgba(110,118,129,0.15); color: var(--pending); }
+  .chip.edited  { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .hole-badge {
+    position: absolute; top: 8px; left: 8px;
+    background: rgba(14,17,22,0.85); color: var(--text);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px; padding: 3px 8px;
+    font-size: 11px; font-weight: 600;
+    pointer-events: none;
+  }
+  .hole-badge .par { color: var(--accent); margin-left: 4px; }
+  .flag-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--weak);
+  }
+  .empty { color: var(--muted); padding: 32px; text-align: center; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Golf clipper</h1>
+    <span class="meta" id="round-meta">…</span>
+    <div class="filters">
+      <button class="filter-btn active" data-filter="active">Active</button>
+      <button class="filter-btn" data-filter="needs_fix">Needs fix</button>
+      <button class="filter-btn" data-filter="approved">Approved</button>
+      <button class="filter-btn" data-filter="all">All</button>
+      <button id="approve-all" class="filter-btn" style="background:var(--accent);color:#0e1116;border-color:var(--accent);font-weight:600;">Approve N unmarked</button>
+      <button id="render-all" class="filter-btn" style="background:var(--strong);color:#0e1116;border-color:var(--strong);font-weight:600;">Re-render all</button>
+    </div>
+  </header>
+  <main>
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" style="display:none">No clips match.</div>
+  </main>
+
+<script>
+const TILES = new Map();   // stem -> {el, slot, meta, sig}
+let FILTER = "active";
+
+// Pause off-screen videos to keep the UI smooth.
+const visibility = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    const v = e.target.querySelector("video");
+    if (!v) continue;
+    if (e.isIntersecting) { v.play().catch(() => {}); }
+    else                  { v.pause(); }
+  }
+}, { rootMargin: "200px" });
+
+function sigOf(c) {
+  return [
+    c.confidence, c.flagged, c.edited, c.has_trim, c.review,
+    c.hole, c.render_status,
+  ].join("|");
+}
+
+async function setReview(stem, review) {
+  await fetch(`/api/clips/${encodeURIComponent(stem)}/review`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ review }),
+  });
+  // Optimistic local update
+  const c = LAST_CLIPS.find(x => x.stem === stem);
+  if (c) { c.review = review; render(LAST_CLIPS); updateApproveButton(); }
+}
+
+function makeTile(c) {
+  const tile = document.createElement("div");
+  tile.dataset.stem = c.stem;
+  tile.onclick = (e) => {
+    if (e.target.closest(".edit-btn") || e.target.closest(".trash-btn")) return;
+    const cur = (LAST_CLIPS.find(x => x.stem === c.stem) || c).review || "unreviewed";
+    const next = cur === "needs_fix" ? "unreviewed" : "needs_fix";
+    setReview(c.stem, next);
+  };
+  const slot = document.createElement("div"); slot.className = "slot";
+  const meta = document.createElement("div"); meta.className = "meta";
+  tile.appendChild(slot); tile.appendChild(meta);
+  visibility.observe(tile);
+  return { el: tile, slot, meta };
+}
+
+function fillTile(rec, c) {
+  const review = c.review || "unreviewed";
+  rec.el.className = "tile"
+    + (c.flagged ? " flagged" : "")
+    + (review === "needs_fix" ? " needs_fix" : "")
+    + (review === "approved" ? " approved" : "");
+
+  // Hole badge sits on top of the slot. Re-create per fillTile (cheap).
+  const oldBadge = rec.el.querySelector(".hole-badge");
+  if (oldBadge) oldBadge.remove();
+  if (c.hole != null) {
+    const badge = document.createElement("div");
+    badge.className = "hole-badge";
+    badge.innerHTML = `H${c.hole}<span class="par">P${c.par}</span>`;
+    rec.el.appendChild(badge);
+  }
+
+  // Media slot — only (re)build when has_trim flips.
+  const hasVideo = rec.slot.firstChild?.tagName === "VIDEO";
+  if (c.has_trim && !hasVideo) {
+    rec.slot.innerHTML = "";
+    const v = document.createElement("video");
+    v.src = `/trims/${encodeURIComponent(c.stem)}.mp4`;
+    v.loop = true; v.muted = true; v.playsInline = true;
+    v.preload = "metadata";
+    rec.slot.appendChild(v);
+    // Kick visibility check immediately (might already be on screen).
+    if (rec.el.getBoundingClientRect().top < window.innerHeight + 200) {
+      v.play().catch(() => {});
+    }
+  } else if (!c.has_trim && !hasVideo) {
+    rec.slot.innerHTML = "";
+    const ph = document.createElement("div");
+    ph.className = "placeholder";
+    ph.textContent = c.confidence === "pending" ? "processing…" : "no trim";
+    rec.slot.appendChild(ph);
+  }
+
+  // Meta row — rebuild (cheap, no video).
+  rec.meta.innerHTML = "";
+  const name = document.createElement("div");
+  name.className = "name"; name.textContent = c.stem;
+  rec.meta.appendChild(name);
+  if (c.edited) {
+    const e = document.createElement("span");
+    e.className = "chip edited"; e.textContent = "edited";
+    rec.meta.appendChild(e);
+  }
+  const chip = document.createElement("span");
+  chip.className = "chip " + (c.confidence || "pending");
+  chip.textContent = c.confidence || "pending";
+  rec.meta.appendChild(chip);
+  if (c.flagged) {
+    const dot = document.createElement("span");
+    dot.className = "flag-dot"; dot.title = (c.reasons || []).join("; ");
+    rec.meta.appendChild(dot);
+  }
+  const editBtn = document.createElement("button");
+  editBtn.className = "edit-btn"; editBtn.title = "Open compare view";
+  editBtn.textContent = "✎";
+  editBtn.onclick = (e) => {
+    e.stopPropagation();
+    location.href = `/clip/${encodeURIComponent(c.stem)}`;
+  };
+  rec.meta.appendChild(editBtn);
+
+  const trashBtn = document.createElement("button");
+  trashBtn.className = "trash-btn"; trashBtn.title = "Discard (move to trash/)";
+  trashBtn.textContent = "🗑";
+  trashBtn.onclick = async (e) => {
+    e.stopPropagation();
+    if (!confirm(`Discard ${c.stem}? Files move to clips/<round>/trash/.`)) return;
+    await fetch(`/api/clips/${encodeURIComponent(c.stem)}/discard`, { method: "POST" });
+    LAST_CLIPS = LAST_CLIPS.filter(x => x.stem !== c.stem);
+    render(LAST_CLIPS); updateApproveButton();
+  };
+  rec.meta.appendChild(trashBtn);
+}
+
+function render(clips) {
+  const grid = document.getElementById("grid");
+  const empty = document.getElementById("empty");
+  const filtered = clips.filter(c => {
+    const r = c.review || "unreviewed";
+    if (FILTER === "active")    return r !== "approved";
+    if (FILTER === "needs_fix") return r === "needs_fix";
+    if (FILTER === "approved")  return r === "approved";
+    return true;
+  });
+  empty.style.display = filtered.length ? "none" : "";
+
+  const wantStems = new Set(filtered.map(c => c.stem));
+  // Remove tiles no longer wanted.
+  for (const [stem, rec] of TILES) {
+    if (!wantStems.has(stem)) {
+      visibility.unobserve(rec.el);
+      rec.el.remove(); TILES.delete(stem);
+    }
+  }
+  // Add or update tiles in order.
+  let prev = null;
+  for (const c of filtered) {
+    let rec = TILES.get(c.stem);
+    if (!rec) {
+      rec = makeTile(c);
+      TILES.set(c.stem, rec);
+      grid.appendChild(rec.el);
+    } else if (prev && prev.nextSibling !== rec.el) {
+      grid.insertBefore(rec.el, prev.nextSibling);
+    } else if (!prev && grid.firstChild !== rec.el) {
+      grid.insertBefore(rec.el, grid.firstChild);
+    }
+    const sig = sigOf(c);
+    if (rec.sig !== sig) { fillTile(rec, c); rec.sig = sig; }
+    prev = rec.el;
+  }
+}
+
+let LAST_CLIPS = [];
+
+async function load() {
+  const [round, clips] = await Promise.all([
+    fetch("/api/round").then(r => r.json()),
+    fetch("/api/clips").then(r => r.json()),
+  ]);
+  let label = `${round.round} — ${round.raw_count} clips`;
+  if (round.has_scores) {
+    label += `  •  ${round.course} (${(round.players || []).join(", ")})`;
+  }
+  document.getElementById("round-meta").textContent = label;
+  LAST_CLIPS = clips;
+  render(clips);
+}
+
+document.querySelectorAll(".filter-btn[data-filter]").forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll(".filter-btn[data-filter]").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    FILTER = b.dataset.filter;
+    render(LAST_CLIPS);
+  };
+});
+
+function updateApproveButton() {
+  const btn = document.getElementById("approve-all");
+  const n = LAST_CLIPS.filter(c => (c.review || "unreviewed") === "unreviewed").length;
+  btn.textContent = `Approve ${n} unmarked`;
+  btn.disabled = n === 0;
+  btn.style.opacity = n === 0 ? 0.4 : 1;
+}
+
+document.getElementById("render-all").onclick = async () => {
+  const n = LAST_CLIPS.length;
+  if (!n) return;
+  if (!confirm(`Re-render all ${n} clip(s)? This will rebuild every trim with the current scorecard overlay.`)) return;
+  const r = await fetch("/api/render-all", { method: "POST" }).then(x => x.json());
+  alert(`Queued ${r.queued} render(s).`);
+};
+
+document.getElementById("approve-all").onclick = async () => {
+  const n = LAST_CLIPS.filter(c => (c.review || "unreviewed") === "unreviewed").length;
+  if (!n) return;
+  if (!confirm(`Mark ${n} unmarked clip(s) as approved? They'll move out of Active view.`)) return;
+  await fetch("/api/review/approve_unreviewed", { method: "POST" });
+  const fresh = await fetch("/api/clips").then(r => r.json());
+  LAST_CLIPS = fresh; render(fresh); updateApproveButton();
+};
+
+load().then(updateApproveButton);
+setInterval(async () => {
+  const fresh = await fetch("/api/clips").then(r => r.json());
+  LAST_CLIPS = fresh;
+  render(fresh);
+  updateApproveButton();
+}, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Local secrets
+.env
+
+# Round data — raw video, trims, sidecars, scores
+clips/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

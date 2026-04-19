@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Adjust trim</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --line: #2a313c;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --impact: #f0883e;
+    --window: rgba(88,166,255,0.25);
+    --window-edge: #58a6ff;
+    --weak: #d1242f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+               font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  header {
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 10px 16px; display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: var(--muted); text-decoration: none; }
+  header a:hover { color: var(--accent); }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; flex: 1; }
+  header .status { color: var(--muted); font-size: 12px; }
+  button {
+    background: var(--accent); color: #0e1116; font-weight: 600;
+    border: 0; border-radius: 6px; padding: 6px 14px; cursor: pointer;
+    font-size: 13px;
+  }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 400; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  main { padding: 16px; }
+  .videos {
+    display: grid; gap: 16px;
+    grid-template-columns: 1fr 1fr;
+    margin-bottom: 24px;
+  }
+  .video-block { background: var(--panel); border: 1px solid var(--line);
+                 border-radius: 8px; padding: 12px; }
+  .video-block h2 { font-size: 12px; color: var(--muted); margin: 0 0 8px;
+                    text-transform: uppercase; letter-spacing: 0.5px; }
+  video { width: 100%; max-height: 60vh; background: #000; border-radius: 4px; }
+
+  .controls { background: var(--panel); border: 1px solid var(--line);
+              border-radius: 8px; padding: 16px; }
+  .timeline-wrap { position: relative; user-select: none; padding: 24px 0 32px; }
+  .timeline {
+    position: relative; height: 48px; background: #0a0d12;
+    border: 1px solid var(--line); border-radius: 4px;
+    cursor: crosshair;
+  }
+  .window {
+    position: absolute; top: 0; bottom: 0;
+    background: var(--window);
+    border-left: 2px solid var(--window-edge);
+    border-right: 2px solid var(--window-edge);
+  }
+  .handle {
+    position: absolute; top: -6px; bottom: -6px;
+    width: 14px; background: var(--window-edge);
+    border-radius: 3px; cursor: ew-resize;
+    box-shadow: 0 0 0 2px rgba(0,0,0,0.4);
+  }
+  .handle.left { transform: translateX(-50%); }
+  .handle.right { transform: translateX(-50%); }
+  .impact {
+    position: absolute; top: -10px; bottom: -10px;
+    width: 3px; background: var(--impact); cursor: ew-resize;
+    box-shadow: 0 0 6px var(--impact);
+  }
+  .playhead {
+    position: absolute; top: -4px; bottom: -4px;
+    width: 1px; background: #fff; pointer-events: none; opacity: 0.7;
+  }
+  .ticks {
+    position: absolute; left: 0; right: 0; bottom: -22px;
+    font-size: 10px; color: var(--muted);
+  }
+  .tick { position: absolute; transform: translateX(-50%); }
+
+  .readout {
+    display: flex; gap: 24px; align-items: center;
+    margin-top: 16px; flex-wrap: wrap;
+  }
+  .readout label { color: var(--muted); font-size: 12px; }
+  .readout .v { font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+                color: var(--text); margin-left: 6px; }
+  .actions { margin-left: auto; display: flex; gap: 8px; }
+
+  .reasons { color: var(--weak); font-size: 12px; margin-top: 8px; }
+  .reasons li { margin-left: 16px; }
+</style>
+</head>
+<body>
+  <header>
+    <a href="/">← back</a>
+    <h1 id="title">…</h1>
+    <span class="status" id="status"></span>
+  </header>
+  <main>
+    <div class="videos">
+      <div class="video-block">
+        <h2>Raw — scrub to the strike, then press Space (or click the timeline)</h2>
+        <video id="raw" preload="auto" controls playsinline></video>
+      </div>
+      <div class="video-block">
+        <h2>Current trim</h2>
+        <video id="trim" autoplay loop muted playsinline></video>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="timeline-wrap">
+        <div class="timeline" id="tl" title="Click to place strike here">
+          <div class="window" id="win"></div>
+          <div class="impact" id="imp"></div>
+          <div class="playhead" id="ph"></div>
+        </div>
+        <div class="ticks" id="ticks"></div>
+      </div>
+      <div class="readout">
+        <span><label>strike</label><span class="v" id="rImpact">—</span></span>
+        <span><label>window</label><span class="v" id="rWin">—</span></span>
+        <div class="actions">
+          <button id="markHere">Set strike at playhead (space)</button>
+          <button id="save" style="background:#2ea043;">Save & next</button>
+          <button id="discard" style="background:var(--weak);">Discard</button>
+        </div>
+      </div>
+      <ul class="reasons" id="reasons"></ul>
+    </div>
+  </main>
+
+<script>
+const STEM = decodeURIComponent(location.pathname.split("/").pop());
+const $ = (id) => document.getElementById(id);
+
+let META = null;
+let ORIGINAL = null;     // snapshot of meta as loaded for "Reset"
+let DURATION = 0;        // raw video duration (seconds)
+let TL_RECT = null;      // cached on first interaction
+
+const rawV = $("raw");
+const trimV = $("trim");
+
+async function load() {
+  META = await fetch(`/api/clips/${encodeURIComponent(STEM)}`).then(r => r.json());
+  ORIGINAL = JSON.parse(JSON.stringify(META));
+  $("title").textContent = META.raw + (META.edited ? "  •  edited" : "");
+  rawV.src = `/raw/${encodeURIComponent(META.raw)}`;
+  if (META.has_trim) {
+    trimV.src = `/trims/${encodeURIComponent(STEM)}.mp4?t=${Date.now()}`;
+  }
+  rawV.addEventListener("loadedmetadata", onRawReady, { once: true });
+
+  const reasons = $("reasons");
+  reasons.innerHTML = "";
+  for (const r of (META.reasons || [])) {
+    const li = document.createElement("li");
+    li.textContent = r; reasons.appendChild(li);
+  }
+
+  if (META.render_status && META.render_status !== "done") {
+    $("status").textContent = META.render_status;
+  }
+}
+
+function onRawReady() {
+  DURATION = rawV.duration;
+  drawTicks();
+  layout();
+  // Start playhead a touch before the detected strike so the user can hear it.
+  rawV.currentTime = Math.max(0, (META.impact_s ?? 0) - 1.0);
+  rawV.addEventListener("timeupdate", movePlayhead);
+}
+
+function inSec()  { return Math.max(0, (META.impact_s ?? 0) - META.pre); }
+function outSec() { return Math.min(DURATION, (META.impact_s ?? 0) + META.post); }
+function pctOf(t) { return (t / DURATION) * 100; }
+function tlRect() { return TL_RECT ?? (TL_RECT = $("tl").getBoundingClientRect()); }
+function timeAtX(x) {
+  const r = tlRect();
+  return Math.max(0, Math.min(DURATION, ((x - r.left) / r.width) * DURATION));
+}
+
+function layout() {
+  const inP = pctOf(inSec()), outP = pctOf(outSec()), impP = pctOf(META.impact_s ?? 0);
+  $("win").style.left = inP + "%";
+  $("win").style.width = (outP - inP) + "%";
+  $("imp").style.left = impP + "%";
+  $("rImpact").textContent = (META.impact_s ?? 0).toFixed(3) + "s";
+  $("rWin").textContent = `${inSec().toFixed(2)} → ${outSec().toFixed(2)}s  (${(META.pre + META.post).toFixed(1)}s)`;
+}
+
+function movePlayhead() {
+  $("ph").style.left = pctOf(rawV.currentTime) + "%";
+}
+
+function drawTicks() {
+  const t = $("ticks");
+  t.innerHTML = "";
+  const step = DURATION > 30 ? 5 : DURATION > 10 ? 2 : 1;
+  for (let s = 0; s <= DURATION; s += step) {
+    const el = document.createElement("span");
+    el.className = "tick"; el.style.left = pctOf(s) + "%";
+    el.textContent = s + "s";
+    t.appendChild(el);
+  }
+}
+
+function setImpact(t) {
+  META.impact_s = Math.max(0, Math.min(DURATION, t));
+  // Pre/post stay at config defaults; clamp window to the clip edges.
+  META.pre  = Math.min(ORIGINAL.pre,  META.impact_s);
+  META.post = Math.min(ORIGINAL.post, DURATION - META.impact_s);
+  layout();
+}
+
+$("tl").addEventListener("click", (e) => {
+  TL_RECT = $("tl").getBoundingClientRect();
+  setImpact(timeAtX(e.clientX));
+  rawV.currentTime = META.impact_s;
+  TL_RECT = null;
+});
+
+$("markHere").onclick = () => setImpact(rawV.currentTime);
+
+window.addEventListener("keydown", (e) => {
+  if (e.code !== "Space") return;
+  // Don't fight the video element's own play/pause when it's focused.
+  if (document.activeElement === rawV) return;
+  e.preventDefault();
+  setImpact(rawV.currentTime);
+});
+
+async function gotoNext() {
+  // Find the next still-needs-fix clip after this one in the round order.
+  // If none remain, head back to the grid.
+  const all = await fetch("/api/clips").then(r => r.json());
+  const queue = all.filter(c => (c.review || "unreviewed") === "needs_fix" && c.stem !== STEM);
+  if (!queue.length) { location.href = "/"; return; }
+  // Prefer the next one after the current stem in the round's natural order.
+  const idx = all.findIndex(c => c.stem === STEM);
+  const after = all.slice(idx + 1).find(c => (c.review || "unreviewed") === "needs_fix");
+  const target = after || queue[0];
+  location.href = `/clip/${encodeURIComponent(target.stem)}`;
+}
+
+$("discard").onclick = async () => {
+  if (!confirm(`Discard ${STEM}? Files move to clips/<round>/trash/.`)) return;
+  await fetch(`/api/clips/${encodeURIComponent(STEM)}/discard`, { method: "POST" });
+  gotoNext();
+};
+
+$("save").onclick = async () => {
+  $("save").disabled = true;
+  // Save the new impact, kick render in background, mark approved, go.
+  await fetch(`/api/clips/${encodeURIComponent(STEM)}`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ impact_s: META.impact_s, pre: META.pre, post: META.post }),
+  });
+  // Fire-and-forget — server runs ffmpeg on its thread pool.
+  fetch(`/api/clips/${encodeURIComponent(STEM)}/render`, { method: "POST" });
+  await fetch(`/api/clips/${encodeURIComponent(STEM)}/review`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ review: "approved" }),
+  });
+  gotoNext();
+};
+
+window.addEventListener("resize", () => { TL_RECT = null; });
+load();
+</script>
+</body>
+</html>
