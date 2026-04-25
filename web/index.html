@@ -106,6 +106,48 @@
     width: 8px; height: 8px; border-radius: 50%; background: var(--weak);
   }
   .empty { color: var(--muted); padding: 32px; text-align: center; }
+
+  /* Finalise dialog */
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    z-index: 50; display: none; align-items: center; justify-content: center;
+  }
+  .modal-mask.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    width: min(560px, 90vw); padding: 20px 24px;
+  }
+  .modal h2 { margin: 0 0 4px 0; font-size: 16px; }
+  .modal .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  .modal h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted); margin: 14px 0 8px;
+  }
+  .card-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 0; border-bottom: 1px solid var(--line);
+  }
+  .card-row:last-child { border-bottom: 0; }
+  .card-row label { display: flex; align-items: center; gap: 8px; flex: 1; cursor: pointer; }
+  .card-row .desc { color: var(--muted); font-size: 11px; }
+  .card-row input[type=number] {
+    width: 64px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 6px; font: inherit; text-align: right;
+  }
+  .card-row .unit { color: var(--muted); font-size: 11px; margin-left: -6px; }
+  .modal .actions {
+    display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px;
+  }
+  .modal .actions button {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 14px; cursor: pointer; font: inherit;
+  }
+  .modal .actions button.primary {
+    background: var(--accent); color: var(--bg); border-color: var(--accent);
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -113,20 +155,44 @@
     <h1>Golf clipper</h1>
     <span class="meta" id="round-meta">…</span>
     <div class="filters">
-      <button class="filter-btn active" data-filter="active">Active</button>
-      <button class="filter-btn" data-filter="needs_fix">Needs fix</button>
-      <button class="filter-btn" data-filter="approved">Approved</button>
-      <button class="filter-btn" data-filter="all">All</button>
+      <button class="filter-btn active" data-filter="active"
+              title="Working queue: everything not yet approved (unreviewed + needs fix).">Active</button>
+      <button class="filter-btn" data-filter="needs_fix"
+              title="Only clips you've marked with ✕ for fixing. Subset of Active.">Needs fix</button>
+      <button class="filter-btn" data-filter="approved"
+              title="Clips you've signed off on. Hidden from Active.">Approved</button>
+      <button class="filter-btn" data-filter="all"
+              title="Every clip in the round, regardless of review state.">All</button>
       <button id="approve-all" class="filter-btn" style="background:var(--accent);color:#0e1116;border-color:var(--accent);font-weight:600;">Approve N unmarked</button>
       <button id="render-all" class="filter-btn"
               title="Rebuild every per-clip trim from its raw source — re-cuts the strike window and re-bakes the scorecard / hole-map overlay. Use this after changes to overlay.py or scorecard data. Doesn't touch the final video."
               style="background:var(--strong);color:#0e1116;border-color:var(--strong);font-weight:600;">Re-render all clips</button>
+      <button id="finalise" class="filter-btn" style="background:var(--accent);color:#0e1116;border-color:var(--accent);font-weight:600;">Render final video</button>
+      <a id="final-link" href="/final.mp4" class="filter-btn" style="display:none;background:transparent;color:var(--accent);border-color:var(--accent);text-decoration:none;">Open final.mp4</a>
     </div>
   </header>
   <main>
     <div class="grid" id="grid"></div>
     <div class="empty" id="empty" style="display:none">No clips match.</div>
   </main>
+
+  <div class="modal-mask" id="finalise-modal">
+    <div class="modal">
+      <h2>Render final video</h2>
+      <div class="sub" id="finalise-sub">…</div>
+
+      <h3>Start</h3>
+      <div id="start-cards"></div>
+
+      <h3>End</h3>
+      <div id="end-cards"></div>
+
+      <div class="actions">
+        <button id="finalise-cancel">Cancel</button>
+        <button id="finalise-go" class="primary">Render</button>
+      </div>
+    </div>
+  </div>
 
 <script>
 const TILES = new Map();   // stem -> {el, slot, meta, sig}
@@ -334,6 +400,119 @@ document.getElementById("render-all").onclick = async () => {
   alert(`Queued ${r.queued} render(s).`);
 };
 
+let FINAL_STATE = "idle";
+async function refreshFinalStatus() {
+  try {
+    const s = await fetch("/api/finalise/status").then(r => r.json());
+    FINAL_STATE = s.state;
+    const btn = document.getElementById("finalise");
+    const link = document.getElementById("final-link");
+    // The output file exists during encoding too (ffmpeg -y opens it
+    // immediately). Only treat it as ready when state confirms it.
+    const ready = (s.state === "done" || s.state === "idle") && s.exists;
+    if (s.state === "encoding") {
+      // Live progress %, plus a hint that the button now opens the progress page.
+      const pct = (s.percent != null) ? ` ${(s.percent * 100).toFixed(0)}%` : "";
+      btn.textContent = `Encoding…${pct} · view progress`;
+      btn.disabled = false; btn.style.opacity = 1;
+      btn.title = "Open the live progress page";
+    } else if (s.state === "error") {
+      btn.textContent = "Render final video";
+      btn.disabled = false; btn.style.opacity = 1;
+      btn.title = "Last error: " + (s.message || "unknown");
+    } else if (s.state === "cancelled") {
+      btn.textContent = "Render final video";
+      btn.disabled = false; btn.style.opacity = 1;
+      btn.title = "Previous render cancelled";
+    } else {
+      btn.textContent = ready ? "Re-render final" : "Render final video";
+      btn.disabled = false; btn.style.opacity = 1;
+      btn.title = "";
+    }
+    link.style.display = ready ? "" : "none";
+  } catch {}
+}
+
+// Card definitions — kept in sync with finalise.AVAILABLE_CARDS.
+const CARD_DEFS = [
+  { kind: "title",     label: "Title card",      desc: "Course, date, player names", default_seconds: 3 },
+  { kind: "scorecard", label: "Full scorecard",  desc: "All 18 holes, par, strokes per player", default_seconds: 7 },
+  { kind: "summary",   label: "Round summary",   desc: "Totals, vs par, putts, score breakdown", default_seconds: 6 },
+];
+
+function renderCardOptions(containerId, defaults) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = "";
+  for (const def of CARD_DEFS) {
+    const initial = defaults.find(d => d.kind === def.kind);
+    const row = document.createElement("div");
+    row.className = "card-row";
+    row.innerHTML = `
+      <label>
+        <input type="checkbox" data-kind="${def.kind}" ${initial ? "checked" : ""}>
+        <span>${def.label}<div class="desc">${def.desc}</div></span>
+      </label>
+      <input type="number" min="0.5" max="60" step="0.5"
+             data-sec="${def.kind}"
+             value="${initial ? initial.seconds : def.default_seconds}">
+      <span class="unit">s</span>`;
+    el.appendChild(row);
+  }
+}
+
+function collectCards(containerId) {
+  const el = document.getElementById(containerId);
+  const out = [];
+  for (const cb of el.querySelectorAll("input[type=checkbox]")) {
+    if (!cb.checked) continue;
+    const kind = cb.dataset.kind;
+    const sec = parseFloat(el.querySelector(`input[data-sec="${kind}"]`).value);
+    out.push({ kind, seconds: sec });
+  }
+  return out;
+}
+
+function openFinaliseModal() {
+  const approved = LAST_CLIPS.filter(c => (c.review || "unreviewed") === "approved").length;
+  document.getElementById("finalise-sub").textContent =
+    `${approved} approved clip${approved === 1 ? "" : "s"} will be concatenated chronologically.`;
+  // Sensible defaults: title at start, scorecard at end.
+  renderCardOptions("start-cards", [{ kind: "title", seconds: 3 }]);
+  renderCardOptions("end-cards", [{ kind: "scorecard", seconds: 7 }]);
+  document.getElementById("finalise-modal").classList.add("open");
+}
+
+function closeFinaliseModal() {
+  document.getElementById("finalise-modal").classList.remove("open");
+}
+
+document.getElementById("finalise").onclick = () => {
+  // While encoding, the button doubles as the link to the progress page.
+  if (FINAL_STATE === "encoding") { location.href = "/progress"; return; }
+  const approved = LAST_CLIPS.filter(c => (c.review || "unreviewed") === "approved").length;
+  if (!approved) { alert("No approved clips to render."); return; }
+  openFinaliseModal();
+};
+
+document.getElementById("finalise-cancel").onclick = closeFinaliseModal;
+document.getElementById("finalise-modal").onclick = (e) => {
+  if (e.target.id === "finalise-modal") closeFinaliseModal();
+};
+
+document.getElementById("finalise-go").onclick = async () => {
+  const start = collectCards("start-cards");
+  const end = collectCards("end-cards");
+  closeFinaliseModal();
+  const r = await fetch("/api/finalise", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ start, end }),
+  });
+  if (!r.ok) { alert("Failed to start: " + r.status + " " + await r.text()); return; }
+  // Jump straight to the live progress page so the user can watch ffmpeg work.
+  location.href = "/progress";
+};
+
 document.getElementById("approve-all").onclick = async () => {
   const n = LAST_CLIPS.filter(c => (c.review || "unreviewed") === "unreviewed").length;
   if (!n) return;
@@ -343,12 +522,13 @@ document.getElementById("approve-all").onclick = async () => {
   LAST_CLIPS = fresh; render(fresh); updateApproveButton();
 };
 
-load().then(updateApproveButton);
+load().then(() => { updateApproveButton(); refreshFinalStatus(); });
 setInterval(async () => {
   const fresh = await fetch("/api/clips").then(r => r.json());
   LAST_CLIPS = fresh;
   render(fresh);
   updateApproveButton();
+  refreshFinalStatus();
 }, 3000);
 </script>
 </body>

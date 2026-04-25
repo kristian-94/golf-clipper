@@ -34,6 +34,7 @@ from batch_trim import (
     round_paths,
 )
 from correlate import apply_to_sidecars as correlate_round
+from finalise import render_final
 from smartcaddy import fetch_and_save as smartcaddy_fetch, load_env
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -42,6 +43,8 @@ app = FastAPI()
 STATE: dict = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=2)
 RENDER_STATUS: dict[str, str] = {}  # stem -> "pending" | "rendering" | "done" | "error: ..."
+FINAL_STATUS: dict = {"state": "idle"}  # state: idle|encoding|done|error|cancelled
+FINAL_PID: dict = {}  # {"pid": int} while encoding, used by /cancel
 
 
 def setup_state(round_dir: Path) -> None:
@@ -286,6 +289,115 @@ async def api_render_all():
         asyncio.get_event_loop().run_in_executor(EXECUTOR, _render_job, stem)
         queued.append(stem)
     return {"queued": len(queued), "stems": queued}
+
+
+def _final_job(start_cards, end_cards) -> None:
+    """Run inside the executor. Mutates FINAL_STATUS as ffmpeg progresses."""
+    import os
+    import signal
+
+    def on_start(info: dict) -> None:
+        FINAL_PID["pid"] = info["pid"]
+        FINAL_STATUS["canvas"] = info["canvas"]
+        FINAL_STATUS["segments_total"] = info["segments_total"]
+        FINAL_STATUS["total_s"] = info["total_s"]
+        FINAL_STATUS["started_at"] = __import__("time").time()
+
+    def on_progress(p: dict) -> None:
+        FINAL_STATUS.update(p)
+        FINAL_STATUS["state"] = "encoding"
+
+    try:
+        # Reset transient progress fields from any previous run.
+        for k in ("percent", "elapsed_s", "eta_s", "speed", "fps", "frame",
+                  "segment_index", "segment_label", "segment_kind",
+                  "cpu_percent", "rss_mb", "message"):
+            FINAL_STATUS.pop(k, None)
+        FINAL_STATUS["state"] = "encoding"
+        out = render_final(
+            STATE["round"],
+            start_cards=start_cards, end_cards=end_cards,
+            progress=on_progress, on_start=on_start,
+        )
+        FINAL_STATUS["state"] = "done"
+        FINAL_STATUS["path"] = str(out)
+        # Snap the bar to 100 on success.
+        FINAL_STATUS["percent"] = 1.0
+    except Exception as e:
+        # Distinguish a user-triggered cancel from a real failure.
+        if FINAL_STATUS.get("cancel_requested"):
+            FINAL_STATUS["state"] = "cancelled"
+            FINAL_STATUS["message"] = "cancelled by user"
+        else:
+            FINAL_STATUS["state"] = "error"
+            FINAL_STATUS["message"] = str(e)
+            print(f"[final] ERROR: {e}", flush=True)
+    finally:
+        FINAL_PID.pop("pid", None)
+        FINAL_STATUS.pop("cancel_requested", None)
+
+
+class CardSpec(BaseModel):
+    kind: str
+    seconds: float | None = None
+
+
+class FinaliseRequest(BaseModel):
+    start: list[CardSpec] | None = None
+    end: list[CardSpec] | None = None
+
+
+@app.post("/api/finalise")
+async def api_finalise(req: FinaliseRequest | None = None):
+    if FINAL_STATUS.get("state") == "encoding":
+        raise HTTPException(409, "already encoding")
+    start = [c.model_dump() for c in req.start] if req and req.start is not None else None
+    end = [c.model_dump() for c in req.end] if req and req.end is not None else None
+    FINAL_STATUS["state"] = "encoding"
+    FINAL_STATUS.pop("message", None)
+    asyncio.get_event_loop().run_in_executor(EXECUTOR, _final_job, start, end)
+    return {"state": FINAL_STATUS["state"]}
+
+
+@app.post("/api/finalise/cancel")
+async def api_finalise_cancel():
+    pid = FINAL_PID.get("pid")
+    if not pid or FINAL_STATUS.get("state") != "encoding":
+        raise HTTPException(409, "no encoding in progress")
+    import os
+    import signal as _signal
+    FINAL_STATUS["cancel_requested"] = True
+    try:
+        os.kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    return {"cancelling": True}
+
+
+@app.get("/api/finalise/status")
+async def api_finalise_status():
+    out = STATE["round"] / "final.mp4"
+    return {**FINAL_STATUS, "exists": out.exists()}
+
+
+@app.get("/final.mp4")
+async def serve_final():
+    out = STATE["round"] / "final.mp4"
+    if not out.exists():
+        raise HTTPException(404)
+    # `content_disposition_type="inline"` so browsers stream the video in
+    # their built-in player rather than triggering a download. The filename
+    # is still set for when the user does choose to save it.
+    return FileResponse(
+        out, media_type="video/mp4",
+        filename=f"{STATE['round'].name}.mp4",
+        content_disposition_type="inline",
+    )
+
+
+@app.get("/progress")
+async def progress_page():
+    return FileResponse(WEB_DIR / "progress.html")
 
 
 def main() -> None:

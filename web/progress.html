@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Encoding final video — Golf clipper</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --line: #2a313c;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --strong: #2ea043;
+    --weak: #d1242f;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+               font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  header {
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 12px 18px; display: flex; align-items: center; gap: 14px;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header a { color: var(--muted); text-decoration: none; margin-left: auto; }
+  header a:hover { color: var(--accent); }
+  main {
+    max-width: 760px; margin: 32px auto; padding: 0 18px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 22px;
+  }
+  .card h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted); margin: 0 0 12px;
+  }
+
+  .state-row {
+    display: flex; align-items: baseline; gap: 14px;
+    margin-bottom: 12px;
+  }
+  .state-pill {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+    text-transform: uppercase; padding: 3px 10px; border-radius: 100px;
+  }
+  .state-pill.idle      { background: rgba(110,118,129,0.15); color: var(--muted); }
+  .state-pill.encoding  { background: rgba(88,166,255,0.18); color: var(--accent); }
+  .state-pill.done      { background: rgba(46,160,67,0.18); color: var(--strong); }
+  .state-pill.error     { background: rgba(209,36,47,0.18); color: var(--weak); }
+  .state-pill.cancelled { background: rgba(209,36,47,0.18); color: var(--weak); }
+  .pct {
+    font-size: 32px; font-weight: 700; color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  .bar {
+    width: 100%; height: 8px; background: #0b0e13; border-radius: 100px;
+    overflow: hidden; border: 1px solid var(--line);
+  }
+  .bar > div {
+    height: 100%; background: var(--accent);
+    transition: width 0.4s ease;
+  }
+
+  .grid2 {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px;
+    margin-top: 14px;
+  }
+  .kv { display: flex; justify-content: space-between; gap: 12px; }
+  .kv .k { color: var(--muted); font-size: 12px; }
+  .kv .v { font-variant-numeric: tabular-nums; }
+
+  .seg-line {
+    display: flex; align-items: baseline; gap: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .seg-line .label {
+    flex: 1; min-width: 0; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .seg-line .kind {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+    text-transform: uppercase; color: var(--muted);
+    background: rgba(255,255,255,0.04); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 6px;
+  }
+  .seg-line .idx {
+    color: var(--muted); font-size: 12px;
+  }
+
+  .actions {
+    display: flex; gap: 10px; justify-content: flex-end; margin-top: 4px;
+  }
+  .actions button, .actions a {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 16px; cursor: pointer; font: inherit;
+    text-decoration: none; display: inline-block;
+  }
+  .actions button:disabled { opacity: 0.4; cursor: default; }
+  .actions button.danger {
+    border-color: var(--weak); color: var(--weak);
+  }
+  .actions button.danger:hover { background: var(--weak); color: #fff; }
+  .actions a.primary {
+    background: var(--accent); color: var(--bg); border-color: var(--accent);
+    font-weight: 600;
+  }
+
+  .err {
+    color: var(--weak); font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Final video</h1>
+  <span class="meta" id="round-meta">…</span>
+  <a href="/">← Back to grid</a>
+</header>
+<main>
+
+  <div class="card">
+    <div class="state-row">
+      <span class="state-pill idle" id="state-pill">idle</span>
+      <span class="pct" id="pct">—</span>
+      <span class="muted" id="speed-fps"></span>
+    </div>
+    <div class="bar"><div id="bar-fill" style="width:0%"></div></div>
+    <div class="grid2">
+      <div class="kv"><span class="k">Elapsed</span><span class="v" id="kv-elapsed">—</span></div>
+      <div class="kv"><span class="k">Total</span><span class="v" id="kv-total">—</span></div>
+      <div class="kv"><span class="k">ETA</span><span class="v" id="kv-eta">—</span></div>
+      <div class="kv"><span class="k">Frame</span><span class="v" id="kv-frame">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Now encoding</h2>
+    <div class="seg-line">
+      <span class="idx" id="seg-idx">—</span>
+      <span class="kind" id="seg-kind">—</span>
+      <span class="label" id="seg-label">—</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Output</h2>
+    <div class="grid2">
+      <div class="kv"><span class="k">Resolution</span><span class="v" id="kv-res">—</span></div>
+      <div class="kv"><span class="k">Framerate</span><span class="v" id="kv-fps">—</span></div>
+      <div class="kv"><span class="k">Pixel format</span><span class="v" id="kv-pix">—</span></div>
+      <div class="kv"><span class="k">Profile</span><span class="v" id="kv-profile">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>ffmpeg process</h2>
+    <div class="grid2">
+      <div class="kv"><span class="k">CPU</span><span class="v" id="kv-cpu">—</span></div>
+      <div class="kv"><span class="k">Memory (RSS)</span><span class="v" id="kv-rss">—</span></div>
+    </div>
+  </div>
+
+  <div class="card" id="err-card" style="display:none">
+    <h2>Error</h2>
+    <div class="err" id="err-msg"></div>
+  </div>
+
+  <div class="actions">
+    <button id="btn-cancel" class="danger">Cancel</button>
+    <a id="btn-open" class="primary" href="/final.mp4" style="display:none">Open final.mp4</a>
+  </div>
+</main>
+
+<script>
+function fmt_time(s) {
+  if (s == null || !isFinite(s) || s < 0) return "—";
+  s = Math.round(s);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function setText(id, txt) {
+  document.getElementById(id).textContent = txt;
+}
+
+async function loadRound() {
+  try {
+    const r = await fetch("/api/round").then(x => x.json());
+    let label = r.round;
+    if (r.has_scores) label += `  ·  ${r.course}`;
+    document.getElementById("round-meta").textContent = label;
+  } catch {}
+}
+
+let LAST_STATE = null;
+
+async function refresh() {
+  let s;
+  try {
+    s = await fetch("/api/finalise/status").then(r => r.json());
+  } catch {
+    return;
+  }
+
+  const pill = document.getElementById("state-pill");
+  pill.className = "state-pill " + s.state;
+  pill.textContent = s.state;
+
+  const pct = (s.percent != null) ? s.percent : 0;
+  document.getElementById("bar-fill").style.width = (pct * 100).toFixed(1) + "%";
+  setText("pct", (s.percent != null) ? `${(pct * 100).toFixed(1)}%` : "—");
+
+  const speedTxt = (s.speed ? `${s.speed.toFixed(2)}×` : "") +
+                   (s.fps ? `  ·  ${Math.round(s.fps)} fps` : "");
+  setText("speed-fps", speedTxt);
+
+  setText("kv-elapsed", fmt_time(s.elapsed_s));
+  setText("kv-total", fmt_time(s.total_s));
+  setText("kv-eta", fmt_time(s.eta_s));
+  setText("kv-frame", s.frame != null ? s.frame.toLocaleString() : "—");
+
+  // Segment
+  if (s.segment_index && s.segment_total) {
+    setText("seg-idx", `${s.segment_index} / ${s.segment_total}`);
+  } else {
+    setText("seg-idx", "—");
+  }
+  setText("seg-kind", s.segment_kind || "—");
+  setText("seg-label", s.segment_label || "—");
+
+  // Canvas
+  if (s.canvas) {
+    setText("kv-res", `${s.canvas.width} × ${s.canvas.height}`);
+    const fps = typeof s.canvas.fps === "number" ? s.canvas.fps.toFixed(2).replace(/\.?0+$/, "") : s.canvas.fps_str;
+    setText("kv-fps", `${fps} fps`);
+    setText("kv-pix", s.canvas.pix_fmt);
+    setText("kv-profile", s.canvas.profile);
+  }
+
+  setText("kv-cpu", s.cpu_percent != null ? `${s.cpu_percent.toFixed(1)} %` : "—");
+  setText("kv-rss", s.rss_mb != null ? `${s.rss_mb.toFixed(0)} MB` : "—");
+
+  // Error message
+  const errCard = document.getElementById("err-card");
+  if (s.state === "error" || s.state === "cancelled") {
+    errCard.style.display = "";
+    document.getElementById("err-msg").textContent = s.message || s.state;
+  } else {
+    errCard.style.display = "none";
+  }
+
+  // Buttons
+  const cancelBtn = document.getElementById("btn-cancel");
+  cancelBtn.disabled = s.state !== "encoding";
+  const openBtn = document.getElementById("btn-open");
+  const ready = (s.state === "done" || s.state === "idle") && s.exists;
+  openBtn.style.display = ready ? "" : "none";
+
+  LAST_STATE = s;
+}
+
+document.getElementById("btn-cancel").onclick = async () => {
+  if (!confirm("Cancel the encode? The partial final.mp4 will be left on disk.")) return;
+  const r = await fetch("/api/finalise/cancel", { method: "POST" });
+  if (!r.ok) {
+    const txt = await r.text();
+    alert(`Cancel failed: ${r.status} ${txt}`);
+  }
+};
+
+loadRound();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
