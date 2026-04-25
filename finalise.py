@@ -7,17 +7,22 @@
 Output: clips/<round>/final.mp4 — a title card, every approved trim in
 chronological order, then a scorecard card.
 
-The canvas is sized to the highest-quality clip in the round (max longer
-side x max shorter side, oriented landscape, max framerate, 10-bit if any
-clip is 10-bit) so 4K source material passes through untouched. Smaller
-clips are scaled up with Lanczos and padded to fit. Output is H.264 with
-CRF 12 — meaningfully higher quality than the per-clip trims (CRF 18) so
-the second encode pass doesn't become the quality floor of the round
-(double-encoding at CRF 16 produced visible graininess).
+**No re-encode.** Each per-clip trim is already encoded to the round's
+canvas spec by `overlay.render_video` (one encode per clip, ever). This
+module just renders the title/scorecard cards as short mp4 segments
+matching the same canvas spec, then runs the ffmpeg concat demuxer with
+`-c copy` to byte-append everything into final.mp4. Total runtime for
+the concat step is seconds; the per-card encodes dominate.
 
-Cards are rendered with Pillow at canvas resolution, then turned into
-short video segments with silent audio inside the same ffmpeg call so
-everything is concatenated in one pass.
+This is the architecture that fixes the colour/grain regression we saw
+when finalise re-encoded the (already-encoded) trims a second time.
+
+Canvas selection (`pick_canvas_for_round`):
+  • width  = max longer-side across all raw clips
+  • height = max shorter-side
+  • fps    = max framerate
+  • HDR    = HLG (bt2020/arib-std-b67/bt2020nc, 10-bit, profile high10)
+             if any clip is HDR; otherwise BT.709 SDR. We don't tonemap.
 """
 from __future__ import annotations
 
@@ -41,6 +46,9 @@ DEFAULT_DURATIONS = {
 }
 DEFAULT_START_CARDS = [{"kind": "title", "seconds": DEFAULT_DURATIONS["title"]}]
 DEFAULT_END_CARDS = [{"kind": "scorecard", "seconds": DEFAULT_DURATIONS["scorecard"]}]
+# Encoder settings for card mp4s — the ONLY encode in this module. Trims
+# arrive already encoded (by overlay.render_video) at canvas spec; concat
+# is byte-copy. Match overlay's settings so cards stream-copy with trims.
 CRF = "12"
 PRESET = "slow"
 
@@ -180,6 +188,43 @@ def pick_canvas(infos: list[StreamInfo]) -> dict:
         "fps": fps_pick.fps,
         **color,
     }
+
+
+def pick_canvas_for_round(raw_dir: Path) -> dict:
+    """Compute the canvas spec from every video in `raw_dir`.
+
+    This is the single source of truth for the round's output spec —
+    `overlay.render_video` uses it to normalise every per-clip trim, and
+    `render_final` uses the same spec for the title/scorecard cards so the
+    concat demuxer can byte-copy everything together.
+    """
+    # Late import: batch_trim imports finalise, finalise imports batch_trim
+    # — both via late imports so neither blocks at module-load time.
+    from batch_trim import VIDEO_EXTS
+
+    videos = sorted(
+        p for p in raw_dir.iterdir()
+        if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith(".")
+    )
+    if not videos:
+        raise RuntimeError(f"no videos under {raw_dir}")
+    infos: list[StreamInfo] = []
+    for v in videos:
+        s = _ffprobe_video_stream(v)
+        infos.append(StreamInfo(
+            path=v,
+            width=int(s["width"]),
+            height=int(s["height"]),
+            fps_str=s["r_frame_rate"],
+            fps=_fps_to_float(s["r_frame_rate"]),
+            pix_fmt=s.get("pix_fmt", "yuv420p"),
+            color_space=s.get("color_space", "") or "",
+            color_primaries=s.get("color_primaries", "") or "",
+            color_transfer=s.get("color_transfer", "") or "",
+            recorded_at="",
+            seconds=float(s["duration"]),
+        ))
+    return pick_canvas(infos)
 
 
 # --- Card rendering ---------------------------------------------------
@@ -467,83 +512,47 @@ AVAILABLE_CARDS = ("title", "scorecard", "summary")
 
 # --- Encoding ---------------------------------------------------------
 
-def _build_filter(canvas: dict, n_start: int, n_clips: int,
-                  n_end: int) -> str:
-    """Build the filter_complex string covering N start cards + M clips + K end cards.
+def _encode_card_segment(
+    png_path: Path,
+    seconds: float,
+    canvas: dict,
+    out_path: Path,
+) -> None:
+    """Encode one card PNG → canvas-spec mp4 segment with silent audio.
 
-    Each card contributes two consecutive inputs (PNG, anullsrc). Each clip
-    is one input. Final input order:
-        start cards: [png0, sil0, png1, sil1, ...]   (2*n_start inputs)
-        clips:       [c0, c1, ..., c_{M-1}]          (n_clips inputs)
-        end cards:   [png0, sil0, png1, sil1, ...]   (2*n_end inputs)
-
-    No color conversion. Clips are scaled and padded into the canvas and
-    keep their source color characteristics; the output is tagged once at
-    the encoder level (see `render_final`) to match the canvas's pick. The
-    card PNGs are RGB; ffmpeg auto-converts them into the canvas pix_fmt
-    when they hit `format={pf}`.
+    The output matches every per-clip trim's codec/resolution/fps/colour
+    tags so the concat demuxer can stream-copy them all together.
     """
     W = canvas["width"]
     H = canvas["height"]
-    fps = canvas["fps_str"]
-    pf = canvas["pix_fmt"]
-    parts: list[str] = []
-    seg_labels: list[str] = []
-
-    def card_vid(in_idx: int, label: str) -> None:
-        parts.append(
-            f"[{in_idx}:v]fps={fps},setsar=1,format={pf},setpts=PTS-STARTPTS[{label}]"
-        )
-
-    def silent_aud(in_idx: int, label: str) -> None:
-        parts.append(
-            f"[{in_idx}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-            f"asetpts=PTS-STARTPTS[{label}]"
-        )
-
-    def clip_vid(in_idx: int, label: str) -> None:
-        # Scale to fit, pad to canvas, normalize fps + pix_fmt. Lanczos gives a
-        # clean upscale for 1080p clips on a 4K canvas.
-        parts.append(
-            f"[{in_idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={fps},setsar=1,format={pf},setpts=PTS-STARTPTS[{label}]"
-        )
-
-    def clip_aud(in_idx: int, label: str) -> None:
-        parts.append(
-            f"[{in_idx}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-            f"asetpts=PTS-STARTPTS[{label}]"
-        )
-
-    # Start cards
-    cur = 0
-    for i in range(n_start):
-        v_lbl, a_lbl = f"vs{i}", f"as{i}"
-        card_vid(cur, v_lbl); silent_aud(cur + 1, a_lbl)
-        seg_labels += [v_lbl, a_lbl]
-        cur += 2
-
-    # Clips
-    for i in range(n_clips):
-        v_lbl, a_lbl = f"v{i}", f"a{i}"
-        clip_vid(cur, v_lbl); clip_aud(cur, a_lbl)
-        seg_labels += [v_lbl, a_lbl]
-        cur += 1
-
-    # End cards
-    for i in range(n_end):
-        v_lbl, a_lbl = f"ve{i}", f"ae{i}"
-        card_vid(cur, v_lbl); silent_aud(cur + 1, a_lbl)
-        seg_labels += [v_lbl, a_lbl]
-        cur += 2
-
-    n_segments = n_start + n_clips + n_end
-    concat_inputs = "".join(f"[{l}]" for l in seg_labels)
-    parts.append(
-        f"{concat_inputs}concat=n={n_segments}:v=1:a=1[outv][outa]"
-    )
-    return ";".join(parts)
+    fps_str = canvas["fps_str"]
+    pix_fmt = canvas["pix_fmt"]
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-loop", "1", "-t", f"{seconds:.3f}", "-i", str(png_path),
+        "-f", "lavfi", "-t", f"{seconds:.3f}",
+        "-i", "anullsrc=cl=stereo:r=48000",
+        "-filter_complex",
+        f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"fps={fps_str},setsar=1,format={pix_fmt}[v];"
+        f"[1:a]aformat=sample_rates=48000:channel_layouts=stereo[a]",
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-crf", CRF, "-preset", PRESET,
+        "-profile:v", canvas["profile"],
+        "-color_primaries", canvas["primaries"],
+        "-color_trc", canvas["transfer"],
+        "-colorspace", canvas["matrix"],
+        "-color_range", "tv",
+        "-x264-params",
+        f"colorprim={canvas['primaries']}:transfer={canvas['transfer']}"
+        f":colormatrix={canvas['matrix']}",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
 def _normalise_cards(cards: list[dict] | None, fallback: list[dict]) -> list[dict]:
@@ -561,72 +570,6 @@ def _normalise_cards(cards: list[dict] | None, fallback: list[dict]) -> list[dic
     return out
 
 
-def _ffmpeg_resource(pid: int) -> dict | None:
-    """Return {cpu_percent, rss_mb} for a running ffmpeg pid (or None)."""
-    try:
-        out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "pcpu=,rss="],
-            capture_output=True, text=True, timeout=2,
-        )
-        line = out.stdout.strip()
-        if not line:
-            return None
-        cpu_str, rss_str = line.split()
-        return {"cpu_percent": float(cpu_str), "rss_mb": int(rss_str) / 1024.0}
-    except Exception:
-        return None
-
-
-def _segment_for(elapsed_s: float, segments: list[dict]) -> dict:
-    """Find the segment containing elapsed_s; returns the last one if past end."""
-    for seg in segments:
-        if elapsed_s < seg["end"]:
-            return seg
-    return segments[-1]
-
-
-def _emit_progress(event: dict, segments: list[dict], total_s: float,
-                   pid: int, callback) -> None:
-    if callback is None:
-        return
-
-    def _f(key: str, default: float = 0.0) -> float:
-        try:
-            return float(event.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    elapsed_s = max(0.0, _f("out_time_us") / 1_000_000.0)
-    speed_str = (event.get("speed") or "").rstrip("x").strip()
-    try:
-        speed = float(speed_str)
-    except ValueError:
-        speed = 0.0
-    fps = _f("fps")
-    frame = int(_f("frame"))
-    seg = _segment_for(elapsed_s, segments)
-
-    eta_s = (total_s - elapsed_s) / speed if speed > 0 else None
-    percent = elapsed_s / total_s if total_s > 0 else 0.0
-
-    res = _ffmpeg_resource(pid)
-    callback({
-        "elapsed_s": elapsed_s,
-        "total_s": total_s,
-        "percent": min(1.0, percent),
-        "eta_s": eta_s,
-        "speed": speed,
-        "fps": fps,
-        "frame": frame,
-        "segment_index": seg["index"] + 1,   # 1-indexed for display
-        "segment_total": len(segments),
-        "segment_label": seg["label"],
-        "segment_kind": seg["kind"],
-        "cpu_percent": res["cpu_percent"] if res else None,
-        "rss_mb": res["rss_mb"] if res else None,
-    })
-
-
 def render_final(
     round_dir: Path,
     start_cards: list[dict] | None = None,
@@ -637,17 +580,27 @@ def render_final(
     max_clips: int | None = None,
     out_name: str = "final.mp4",
 ) -> Path:
-    """Encode <round_dir>/<out_name> from approved trims, with custom cards.
+    """Build <round_dir>/<out_name> from approved trims, with custom cards.
 
-    `progress`: optional callable invoked once per ffmpeg progress tick with a
-                dict {elapsed_s, total_s, percent, eta_s, speed, fps, frame,
-                segment_*, cpu_percent, rss_mb}. Use this to surface a UI.
-    `on_start`: optional callable invoked once with {canvas, segments,
-                total_s, pid} just after ffmpeg launches — lets the caller
-                stash the pid for cancellation.
-    `max_clips`: optional cap on the number of clips concatenated, useful for
-                fast iteration when tuning the encoder.
-    `out_name`: filename written under round_dir (default: final.mp4).
+    Two-phase pipeline:
+      1. Encode each title/scorecard card into a short canvas-spec mp4.
+      2. Run the ffmpeg concat demuxer with `-c copy` over the cards and
+         all approved trims to byte-append them into final.mp4.
+
+    The trims must already be encoded to the round's canvas spec — that's
+    what `overlay.render_video` does at trim time. If a trim doesn't match
+    canvas, `-c copy` will refuse and ffmpeg will error; the fix is to
+    re-render the offending clip via the UI's "Re-render all clips" button.
+
+    `progress`: optional callable invoked with progress dicts. The schema
+                matches the old filter_complex pipeline so the UI keeps
+                working unchanged: {elapsed_s, total_s, percent, eta_s,
+                speed, fps, frame, segment_index, segment_total,
+                segment_label, segment_kind, cpu_percent, rss_mb}.
+    `on_start`: optional callable invoked once with {canvas, segments_total,
+                total_s, pid} just after the concat ffmpeg launches.
+    `max_clips`: optional cap on the number of clips, useful for testing.
+    `out_name`: filename written under round_dir.
     """
     # Late import to avoid circular module dependency with batch_trim.
     from batch_trim import round_paths
@@ -656,36 +609,57 @@ def render_final(
     end_cards = _normalise_cards(end_cards, DEFAULT_END_CARDS)
 
     raw_dir, trims_dir, meta_dir = round_paths(round_dir)
+    canvas = pick_canvas_for_round(raw_dir)
     infos = gather_approved(meta_dir, trims_dir)
     if not infos:
         raise RuntimeError("no approved clips with rendered trims")
     if max_clips is not None and max_clips > 0:
         infos = infos[:max_clips]
         log(f"[final] limiting to first {len(infos)} clips (max_clips={max_clips})")
-    canvas = pick_canvas(infos)
     n_hdr = sum(1 for i in infos if i.is_hdr())
-    log(f"[final] {len(infos)} approved clips ({n_hdr} HDR, passthrough)  "
+    log(f"[final] {len(infos)} approved clips ({n_hdr} HDR)  "
         f"canvas: {canvas['width']}x{canvas['height']} @ {canvas['fps_str']} "
         f"({canvas['pix_fmt']}, {canvas['primaries']}/{canvas['transfer']}/"
         f"{canvas['matrix']})")
     log(f"[final] start cards: {[c['kind'] for c in start_cards]}  "
         f"end cards: {[c['kind'] for c in end_cards]}")
 
-    # Build the segment timeline: cards then clips then cards. Each clip's
-    # duration comes from ffprobe (real on-disk length, not nominal pre+post).
+    # Warn if any trim's params drifted from canvas (would break -c copy).
+    mismatches: list[str] = []
+    for inf in infos:
+        if (inf.width, inf.height) != (canvas["width"], canvas["height"]):
+            mismatches.append(
+                f"{inf.path.name}: {inf.width}x{inf.height} (canvas "
+                f"{canvas['width']}x{canvas['height']})")
+        elif inf.pix_fmt != canvas["pix_fmt"]:
+            mismatches.append(
+                f"{inf.path.name}: pix_fmt={inf.pix_fmt} (canvas "
+                f"{canvas['pix_fmt']})")
+    if mismatches:
+        log("[final] WARNING: trims don't match canvas — re-render them:")
+        for m in mismatches[:5]:
+            log(f"        {m}")
+        if len(mismatches) > 5:
+            log(f"        … and {len(mismatches) - 5} more")
+
+    # Build the segment timeline (cards then clips then cards). Used both
+    # for progress mapping and for assembling the concat list.
     segments: list[dict] = []
     t = 0.0
     for c in start_cards:
         segments.append({"kind": f"card:{c['kind']}", "label": c["kind"].title(),
-                         "start": t, "end": t + c["seconds"], "index": len(segments)})
+                         "start": t, "end": t + c["seconds"], "index": len(segments),
+                         "seconds": c["seconds"], "card_kind": c["kind"]})
         t += c["seconds"]
     for inf in infos:
         segments.append({"kind": "clip", "label": inf.path.stem,
-                         "start": t, "end": t + inf.seconds, "index": len(segments)})
+                         "start": t, "end": t + inf.seconds, "index": len(segments),
+                         "trim_path": inf.path, "seconds": inf.seconds})
         t += inf.seconds
     for c in end_cards:
         segments.append({"kind": f"card:{c['kind']}", "label": c["kind"].title(),
-                         "start": t, "end": t + c["seconds"], "index": len(segments)})
+                         "start": t, "end": t + c["seconds"], "index": len(segments),
+                         "seconds": c["seconds"], "card_kind": c["kind"]})
         t += c["seconds"]
     total_s = t
 
@@ -696,69 +670,87 @@ def render_final(
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
 
-        def png_for(prefix: str, idx: int, kind: str) -> Path:
+        # --- Phase 1: encode each card to an mp4 segment that matches canvas.
+        # The trims are already on disk at canvas spec; only the cards need
+        # to be encoded fresh each finalise (the score/title content can
+        # change between runs).
+        n_cards = sum(1 for s in segments if s["kind"].startswith("card:"))
+        log(f"[final] encoding {n_cards} card segment(s)…")
+
+        if on_start is not None:
+            on_start({
+                "canvas": canvas,
+                "segments_total": len(segments),
+                "total_s": total_s,
+                "pid": None,
+            })
+
+        cards_done = 0
+        for seg in segments:
+            if not seg["kind"].startswith("card:"):
+                continue
+            kind = seg["card_kind"]
             img = render_card_image(kind, canvas, scores, round_dir.name)
-            p = td_path / f"{prefix}{idx}_{kind}.png"
-            img.save(p)
-            return p
+            png = td_path / f"card_{seg['index']:03d}_{kind}.png"
+            img.save(png)
+            seg_mp4 = td_path / f"card_{seg['index']:03d}_{kind}.mp4"
+            _encode_card_segment(png, seg["seconds"], canvas, seg_mp4)
+            seg["trim_path"] = seg_mp4
+            cards_done += 1
+            if progress is not None:
+                # Cards are typically 3–7s each; report rough progress so the
+                # UI doesn't sit silent during this phase.
+                progress({
+                    "elapsed_s": seg["end"],
+                    "total_s": total_s,
+                    "percent": min(0.95, seg["end"] / total_s),
+                    "eta_s": None,
+                    "speed": 0.0,
+                    "fps": 0.0,
+                    "frame": 0,
+                    "segment_index": seg["index"] + 1,
+                    "segment_total": len(segments),
+                    "segment_label": seg["label"],
+                    "segment_kind": seg["kind"],
+                    "cpu_percent": None,
+                    "rss_mb": None,
+                })
 
-        cmd: list[str] = [
+        # --- Phase 2: concat-copy. Build a list file for the demuxer.
+        list_path = td_path / "concat_list.txt"
+        with list_path.open("w") as fh:
+            for seg in segments:
+                # `file '...'` — single-quote, escape any embedded quotes per
+                # ffmpeg concat demuxer rules. Absolute paths are essential:
+                # the demuxer resolves relative entries against the list
+                # file's directory (a temp dir here), not the process cwd, so
+                # relative trim paths silently fail to open and ffmpeg exits
+                # rc=0 with a truncated output (only the title card lands).
+                p = str(Path(seg["trim_path"]).resolve()).replace("'", "'\\''")
+                fh.write(f"file '{p}'\n")
+        log("[final] concat-copy…")
+
+        cmd = [
             "ffmpeg", "-y", "-v", "error", "-nostats",
-            "-progress", "pipe:1",
-        ]
-
-        for i, c in enumerate(start_cards):
-            png = png_for("start", i, c["kind"])
-            cmd += [
-                "-loop", "1", "-t", f"{c['seconds']:.3f}", "-i", str(png),
-                "-f", "lavfi", "-t", f"{c['seconds']:.3f}",
-                "-i", "anullsrc=cl=stereo:r=48000",
-            ]
-        for inf in infos:
-            cmd += ["-i", str(inf.path)]
-        for i, c in enumerate(end_cards):
-            png = png_for("end", i, c["kind"])
-            cmd += [
-                "-loop", "1", "-t", f"{c['seconds']:.3f}", "-i", str(png),
-                "-f", "lavfi", "-t", f"{c['seconds']:.3f}",
-                "-i", "anullsrc=cl=stereo:r=48000",
-            ]
-        cmd += [
-            "-filter_complex",
-            _build_filter(canvas, len(start_cards), len(infos), len(end_cards)),
-            "-map", "[outv]", "-map", "[outa]",
-            "-c:v", "libx264", "-profile:v", canvas["profile"],
-            "-crf", CRF, "-preset", PRESET,
-            # Tag the output with the canvas's color characteristics.
-            # We don't tonemap — HLG sources stay HLG so HDR-capable
-            # players show them at full brightness. Without these tags
-            # the H.264 VUI ends up "unknown" and players fall back to
-            # generic BT.709 decoding, which is what produced the
-            # washed-out look.
-            "-color_primaries", canvas["primaries"],
-            "-color_trc", canvas["transfer"],
-            "-colorspace", canvas["matrix"],
-            "-color_range", "tv",
-            "-x264-params",
-            f"colorprim={canvas['primaries']}:transfer={canvas['transfer']}"
-            f":colormatrix={canvas['matrix']}",
-            "-c:a", "aac", "-b:a", "192k",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
             "-movflags", "+faststart",
             str(out_path),
         ]
-        log("[final] encoding…")
-
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
+        # Update on_start with the real pid (cancel button uses this).
         if on_start is not None:
             on_start({
-                "canvas": canvas, "segments_total": len(segments),
-                "total_s": total_s, "pid": proc.pid,
+                "canvas": canvas,
+                "segments_total": len(segments),
+                "total_s": total_s,
+                "pid": proc.pid,
             })
 
-        # Drain stderr in a background thread (only used for error reporting).
         stderr_lines: list[str] = []
         def _drain_stderr() -> None:
             assert proc.stderr is not None
@@ -766,22 +758,42 @@ def render_final(
                 stderr_lines.append(line)
         threading.Thread(target=_drain_stderr, daemon=True).start()
 
-        # Parse stdout key=value progress events.
-        event: dict[str, str] = {}
-        assert proc.stdout is not None
-        for raw in proc.stdout:
-            line = raw.strip()
-            if not line or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            event[k] = v.strip()
-            if k == "progress":
-                _emit_progress(event, segments, total_s, proc.pid, progress)
-                event = {}
         rc = proc.wait()
         if rc != 0:
             tail = "".join(stderr_lines)[-2000:]
             raise subprocess.CalledProcessError(rc, cmd, tail)
+
+        # The concat demuxer logs "Impossible to open ..." for missing
+        # segments but still exits rc=0 with a truncated output. Cross-check
+        # the actual output duration against the planned timeline so any
+        # silent skip surfaces as a hard error (not a 3-second `final.mp4`).
+        actual_s = float(_ffprobe_video_stream(out_path)["duration"])
+        if actual_s + 0.5 < total_s:
+            tail = "".join(stderr_lines)[-2000:]
+            raise RuntimeError(
+                f"concat output is {actual_s:.2f}s but timeline is "
+                f"{total_s:.2f}s — ffmpeg silently skipped segments. "
+                f"stderr tail:\n{tail}"
+            )
+
+        # Snap to 100% on the final frame.
+        if progress is not None:
+            progress({
+                "elapsed_s": total_s,
+                "total_s": total_s,
+                "percent": 1.0,
+                "eta_s": 0.0,
+                "speed": 0.0,
+                "fps": 0.0,
+                "frame": 0,
+                "segment_index": len(segments),
+                "segment_total": len(segments),
+                "segment_label": segments[-1]["label"],
+                "segment_kind": segments[-1]["kind"],
+                "cpu_percent": None,
+                "rss_mb": None,
+            })
+
     log(f"[final] wrote {out_path}")
     return out_path
 

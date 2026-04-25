@@ -34,7 +34,7 @@ from batch_trim import (
     round_paths,
 )
 from correlate import apply_to_sidecars as correlate_round
-from finalise import render_final
+from finalise import pick_canvas_for_round, render_final
 from smartcaddy import fetch_and_save as smartcaddy_fetch, load_env
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -45,6 +45,45 @@ EXECUTOR = ThreadPoolExecutor(max_workers=2)
 RENDER_STATUS: dict[str, str] = {}  # stem -> "pending" | "rendering" | "done" | "error: ..."
 FINAL_STATUS: dict = {"state": "idle"}  # state: idle|encoding|done|error|cancelled
 FINAL_PID: dict = {}  # {"pid": int} while encoding, used by /cancel
+# Aggregate status for the "Re-render all clips" batch job — feeds /progress.
+# state: idle|running|done|error. Per-stem state remains in RENDER_STATUS.
+BATCH_STATUS: dict = {"state": "idle"}
+
+
+def _ffmpeg_children_resource() -> dict:
+    """Sum CPU% and RSS across all ffmpeg processes on the box.
+
+    Used to give the progress UI a feel for the batch job's footprint —
+    EXECUTOR may have up to two render workers active at once, each with
+    its own ffmpeg child. We don't bother filtering to children of this
+    pid (other ffmpeg invocations on the box are rare during a render).
+    """
+    try:
+        out = __import__("subprocess").run(
+            ["ps", "-axo", "pid,pcpu,rss,comm"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return {"cpu_percent": None, "rss_mb": None, "n_procs": 0}
+    cpu = 0.0
+    rss_mb = 0.0
+    n = 0
+    for line in out.stdout.splitlines()[1:]:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        _pid, pcpu, rss_kb, comm = parts
+        if "ffmpeg" not in comm:
+            continue
+        try:
+            cpu += float(pcpu)
+            rss_mb += float(rss_kb) / 1024.0
+            n += 1
+        except ValueError:
+            continue
+    if n == 0:
+        return {"cpu_percent": None, "rss_mb": None, "n_procs": 0}
+    return {"cpu_percent": cpu, "rss_mb": rss_mb, "n_procs": n}
 
 
 def setup_state(round_dir: Path) -> None:
@@ -54,6 +93,15 @@ def setup_state(round_dir: Path) -> None:
     STATE["trims"] = trims
     STATE["meta"] = meta
     STATE["scores"] = round_dir / "scores.json"
+    # Canvas is the round's canonical output spec — every per-clip render
+    # encodes to it so finalise.py can byte-copy them together. Computed
+    # once here from the raw clips; identical across renders unless the
+    # raw set changes.
+    STATE["canvas"] = pick_canvas_for_round(raw)
+    cv = STATE["canvas"]
+    print(f"canvas: {cv['width']}x{cv['height']} @ {cv['fps_str']} "
+          f"({cv['pix_fmt']}, {cv['primaries']}/{cv['transfer']}/{cv['matrix']})",
+          flush=True)
 
 
 def initial_batch() -> None:
@@ -92,7 +140,7 @@ def initial_batch() -> None:
         print(f"[batch] render {stem}", flush=True)
         try:
             RENDER_STATUS[stem] = "rendering"
-            status = render_from_sidecar(meta_path, raw, trims)
+            status = render_from_sidecar(meta_path, raw, trims, STATE["canvas"])
             RENDER_STATUS[stem] = "done" if status == "ok" else f"error: {status}"
         except Exception as e:
             RENDER_STATUS[stem] = f"error: {e}"
@@ -254,15 +302,49 @@ async def api_update_clip(stem: str, update: ClipUpdate):
     return _read_meta(stem)
 
 
+def _batch_started(stem: str) -> None:
+    """Called when a render job begins — only counts toward batch if queued."""
+    if BATCH_STATUS.get("state") != "running":
+        return
+    if stem not in BATCH_STATUS.get("queued_stems", set()):
+        return
+    BATCH_STATUS["in_progress"].add(stem)
+    BATCH_STATUS["current_label"] = stem
+
+
+def _batch_finished(stem: str, ok: bool, msg: str = "") -> None:
+    """Called when a render job ends. Updates counters; flips state when done."""
+    if BATCH_STATUS.get("state") != "running":
+        return
+    if stem not in BATCH_STATUS.get("queued_stems", set()):
+        return
+    BATCH_STATUS["in_progress"].discard(stem)
+    if ok:
+        BATCH_STATUS["completed"] += 1
+    else:
+        BATCH_STATUS["errors"] += 1
+        BATCH_STATUS["errors_list"].append({"stem": stem, "msg": msg})
+    done = BATCH_STATUS["completed"] + BATCH_STATUS["errors"]
+    if done >= BATCH_STATUS["total"]:
+        BATCH_STATUS["state"] = "error" if BATCH_STATUS["errors"] else "done"
+        BATCH_STATUS["finished_at"] = __import__("time").time()
+
+
 def _render_job(stem: str) -> None:
-    """Single-pass trim+overlay from sidecar. Overlay is baked in if hole info present."""
+    """Single-pass trim+overlay+normalize from sidecar. Output matches canvas."""
     try:
         RENDER_STATUS[stem] = "rendering"
+        _batch_started(stem)
         meta_path = STATE["meta"] / f"{stem}.json"
-        status = render_from_sidecar(meta_path, STATE["raw"], STATE["trims"])
-        RENDER_STATUS[stem] = "done" if status == "ok" else f"error: {status}"
+        status = render_from_sidecar(
+            meta_path, STATE["raw"], STATE["trims"], STATE["canvas"],
+        )
+        ok = status == "ok"
+        RENDER_STATUS[stem] = "done" if ok else f"error: {status}"
+        _batch_finished(stem, ok, "" if ok else status)
     except Exception as e:
         RENDER_STATUS[stem] = f"error: {e}"
+        _batch_finished(stem, False, str(e))
 
 
 @app.post("/api/clips/{stem}/render")
@@ -282,13 +364,65 @@ async def api_status(stem: str):
 @app.post("/api/render-all")
 async def api_render_all():
     """Queue a re-render of every clip with a sidecar (overlay baked in if available)."""
-    queued = []
+    if BATCH_STATUS.get("state") == "running":
+        raise HTTPException(409, "batch already running")
+    stems: list[str] = []
     for meta_path in sorted(STATE["meta"].glob("*.json")):
-        stem = meta_path.stem
+        stems.append(meta_path.stem)
+    # Initialise aggregate batch status BEFORE queuing — workers race the
+    # main loop, so the queued_stems set must be visible when they start.
+    BATCH_STATUS.clear()
+    BATCH_STATUS.update({
+        "state": "running",
+        "started_at": __import__("time").time(),
+        "total": len(stems),
+        "completed": 0,
+        "errors": 0,
+        "in_progress": set(),
+        "queued_stems": set(stems),
+        "current_label": None,
+        "errors_list": [],
+        "canvas": STATE.get("canvas"),
+    })
+    for stem in stems:
         RENDER_STATUS[stem] = "pending"
         asyncio.get_event_loop().run_in_executor(EXECUTOR, _render_job, stem)
-        queued.append(stem)
-    return {"queued": len(queued), "stems": queued}
+    return {"queued": len(stems), "stems": stems}
+
+
+@app.get("/api/render-all/status")
+async def api_render_all_status():
+    """Aggregate progress for the latest re-render-all run.
+
+    Combines counters from BATCH_STATUS with a live ffmpeg CPU/RSS sample so
+    the /progress page can show the same shape of card as the finalise job.
+    """
+    s: dict = {}
+    for k, v in BATCH_STATUS.items():
+        if isinstance(v, set):
+            s[k] = sorted(v)
+        else:
+            s[k] = v
+    state = s.get("state", "idle")
+    if state == "running":
+        elapsed = __import__("time").time() - s["started_at"]
+        done = s["completed"] + s["errors"]
+        s["elapsed_s"] = elapsed
+        s["percent"] = (done / s["total"]) if s["total"] else 0.0
+        # ETA: extrapolate from average per-clip time so far.
+        if done > 0 and elapsed > 0:
+            s["eta_s"] = elapsed / done * (s["total"] - done)
+        else:
+            s["eta_s"] = None
+        s.update(_ffmpeg_children_resource())
+    elif state in ("done", "error"):
+        s["elapsed_s"] = s.get("finished_at", 0) - s.get("started_at", 0)
+        s["percent"] = 1.0
+        s["eta_s"] = 0.0
+        s["cpu_percent"] = None
+        s["rss_mb"] = None
+        s["n_procs"] = 0
+    return s
 
 
 def _final_job(start_cards, end_cards) -> None:
@@ -297,11 +431,17 @@ def _final_job(start_cards, end_cards) -> None:
     import signal
 
     def on_start(info: dict) -> None:
-        FINAL_PID["pid"] = info["pid"]
-        FINAL_STATUS["canvas"] = info["canvas"]
-        FINAL_STATUS["segments_total"] = info["segments_total"]
-        FINAL_STATUS["total_s"] = info["total_s"]
-        FINAL_STATUS["started_at"] = __import__("time").time()
+        # render_final calls on_start twice: first before encoding cards
+        # (pid=None — there's no single ffmpeg yet, each card is its own
+        # short subprocess), and then again with the real pid right before
+        # the concat-copy phase. Only the second call has a cancellable pid.
+        if info.get("pid"):
+            FINAL_PID["pid"] = info["pid"]
+        if "canvas" in info:
+            FINAL_STATUS["canvas"] = info["canvas"]
+            FINAL_STATUS["segments_total"] = info["segments_total"]
+            FINAL_STATUS["total_s"] = info["total_s"]
+            FINAL_STATUS.setdefault("started_at", __import__("time").time())
 
     def on_progress(p: dict) -> None:
         FINAL_STATUS.update(p)

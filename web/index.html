@@ -396,8 +396,15 @@ document.getElementById("render-all").onclick = async () => {
   const n = LAST_CLIPS.length;
   if (!n) return;
   if (!confirm(`Re-render all ${n} clip(s)? This will rebuild every trim with the current scorecard overlay.`)) return;
-  const r = await fetch("/api/render-all", { method: "POST" }).then(x => x.json());
-  alert(`Queued ${r.queued} render(s).`);
+  const r = await fetch("/api/render-all", { method: "POST" });
+  if (!r.ok) {
+    const txt = await r.text();
+    alert(`Failed to queue: ${r.status} ${txt}`);
+    return;
+  }
+  // Hop to the progress page so the user sees CPU / memory / per-clip
+  // status in real time instead of a fire-and-forget alert.
+  window.location.href = "/progress";
 };
 
 let FINAL_STATE = "idle";

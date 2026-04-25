@@ -2,13 +2,18 @@
 # requires-python = ">=3.11"
 # dependencies = ["pillow"]
 # ///
-"""Scorecard card rendering + a single-pass trim+overlay encoder.
+"""Scorecard card rendering + a single-pass trim+overlay+normalize encoder.
 
-The card image is built with Pillow; trim+overlay is one ffmpeg call so we
-only re-encode each clip once. When `card` is None the function just trims.
+The card image is built with Pillow; trim, overlay composite, canvas
+normalisation (scale/pad/fps/pix_fmt) and final encode all happen in one
+ffmpeg call so each clip is encoded exactly once. The output is then
+byte-copied straight into the round's `final.mp4` by `finalise.py`'s
+concat demuxer — no second encode, no quality drop.
 
-Source resolution, framerate, pixel format, and bit depth pass through
-unchanged so 1080p60 / 4K60 / 10-bit footage is preserved.
+Every per-clip output matches the round's canvas spec (dimensions, fps,
+pix_fmt, profile, color tags, audio params) so the concat demuxer can
+stream-copy them. The canvas is computed once for the round by
+`finalise.pick_canvas_for_round`.
 """
 from __future__ import annotations
 
@@ -163,16 +168,10 @@ def render_card(
 
 # --- Encoder ------------------------------------------------------------
 
-def _probe_pix_fmt(src: Path) -> str | None:
-    """Return the source video stream's pixel format, e.g. 'yuv420p10le'."""
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=pix_fmt",
-         "-of", "default=nw=1:nk=1", str(src)],
-        capture_output=True, text=True,
-    )
-    val = out.stdout.strip()
-    return val or None
+# Encode quality for the per-clip render. This is now the ONLY encode in
+# the whole pipeline (concat is byte-copy), so we spend bits here.
+CRF = "12"
+PRESET = "slow"
 
 
 def render_video(
@@ -180,18 +179,39 @@ def render_video(
     start: float,
     duration: float,
     dst: Path,
+    canvas: dict,
     card: Image.Image | None = None,
 ) -> None:
-    """Trim raw_path[start..start+duration] → dst as H.264.
+    """Trim raw_path[start..start+duration] → dst, normalised to canvas.
 
-    If `card` is provided, composites it top-right in the same pass — only
-    one re-encode per clip. Pixel format / bit depth are matched to the
-    source so 10-bit / 4K / 60fps survive untouched.
+    Single ffmpeg pass: trim → scale+pad to canvas dims → fps adjust →
+    pix_fmt convert → optional card overlay → libx264 encode with canvas
+    color tags. Audio is normalised to 48 kHz stereo AAC 192 k. The output
+    matches every other clip in the round so `finalise.py` can stream-copy
+    them all together with no second encode.
+
+    `canvas` is the dict returned by `finalise.pick_canvas_for_round`:
+    keys `width`, `height`, `fps_str`, `pix_fmt`, `profile`, `primaries`,
+    `transfer`, `matrix`.
     """
     start = max(0.0, start)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    src_pix_fmt = _probe_pix_fmt(raw_path) or "yuv420p"
-    profile = "high10" if "10" in src_pix_fmt else "high"
+
+    W = canvas["width"]
+    H = canvas["height"]
+    fps_str = canvas["fps_str"]
+    pix_fmt = canvas["pix_fmt"]
+    profile = canvas["profile"]
+
+    # Build the video filter chain. Lower-res clips are upscaled with Lanczos
+    # and letterboxed; lower-fps clips get frame-doubled by the fps filter
+    # (no interpolation — visually the clip plays at its source rate inside
+    # a higher-fps container, which is what we want).
+    base_chain = (
+        f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"fps={fps_str},setsar=1,format={pix_fmt}"
+    )
 
     # `-ss` and `-t` are both input options for the source video here. Putting
     # `-t` after the first `-i` would make it bind to the *next* input (the
@@ -210,15 +230,41 @@ def render_video(
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 png_path = Path(tmp.name)
             card.save(png_path)
+            # The overlay filter promotes the canvas to 4:4:4 to do alpha
+            # blending with the RGBA card; libx264's `high10` profile only
+            # supports 4:2:0 / 4:2:2, so we explicitly format back to the
+            # canvas pix_fmt after the overlay to keep the encoder happy.
             cmd += [
                 "-i", str(png_path),
                 "-filter_complex",
-                f"[0:v][1:v]overlay=x=W-w-{MARGIN}:y={MARGIN}:format=auto,format={src_pix_fmt}",
+                f"[0:v]{base_chain}[base];"
+                f"[base][1:v]overlay=x=W-w-{MARGIN}:y={MARGIN}:format=auto,"
+                f"format={pix_fmt}[v];"
+                f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a]",
+                "-map", "[v]", "-map", "[a]",
+            ]
+        else:
+            cmd += [
+                "-filter_complex",
+                f"[0:v]{base_chain}[v];"
+                f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a]",
+                "-map", "[v]", "-map", "[a]",
             ]
         cmd += [
-            "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+            "-c:v", "libx264", "-crf", CRF, "-preset", PRESET,
             "-profile:v", profile,
-            "-c:a", "aac", "-b:a", "192k",
+            # Tag the output with the canvas's color characteristics — both
+            # the libavformat container flags AND the x264 VUI need this, or
+            # the file ends up "color_*=unknown" and players fall back to
+            # generic BT.709 decoding (visible washed-out look).
+            "-color_primaries", canvas["primaries"],
+            "-color_trc", canvas["transfer"],
+            "-colorspace", canvas["matrix"],
+            "-color_range", "tv",
+            "-x264-params",
+            f"colorprim={canvas['primaries']}:transfer={canvas['transfer']}"
+            f":colormatrix={canvas['matrix']}",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
             str(dst),
         ]

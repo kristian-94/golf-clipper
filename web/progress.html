@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Encoding final video — Golf clipper</title>
+<title>Job progress — Golf clipper</title>
 <style>
   :root {
     --bg: #0e1116;
@@ -37,6 +37,7 @@
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--muted); margin: 0 0 12px;
   }
+  .card.dim { opacity: 0.4; }
 
   .state-row {
     display: flex; align-items: baseline; gap: 14px;
@@ -47,7 +48,8 @@
     text-transform: uppercase; padding: 3px 10px; border-radius: 100px;
   }
   .state-pill.idle      { background: rgba(110,118,129,0.15); color: var(--muted); }
-  .state-pill.encoding  { background: rgba(88,166,255,0.18); color: var(--accent); }
+  .state-pill.encoding,
+  .state-pill.running   { background: rgba(88,166,255,0.18); color: var(--accent); }
   .state-pill.done      { background: rgba(46,160,67,0.18); color: var(--strong); }
   .state-pill.error     { background: rgba(209,36,47,0.18); color: var(--weak); }
   .state-pill.cancelled { background: rgba(209,36,47,0.18); color: var(--weak); }
@@ -115,11 +117,18 @@
   }
 
   .muted { color: var(--muted); }
+
+  .err-list { margin: 8px 0 0; padding: 0; list-style: none; max-height: 180px;
+              overflow: auto; font-size: 12px; }
+  .err-list li { padding: 4px 0; border-bottom: 1px solid var(--line);
+                 font-family: ui-monospace, SFMono-Regular, monospace;
+                 color: var(--weak); }
+  .err-list li:last-child { border-bottom: 0; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Final video</h1>
+  <h1 id="page-title">Job progress</h1>
   <span class="meta" id="round-meta">…</span>
   <a href="/">← Back to grid</a>
 </header>
@@ -133,15 +142,15 @@
     </div>
     <div class="bar"><div id="bar-fill" style="width:0%"></div></div>
     <div class="grid2">
-      <div class="kv"><span class="k">Elapsed</span><span class="v" id="kv-elapsed">—</span></div>
-      <div class="kv"><span class="k">Total</span><span class="v" id="kv-total">—</span></div>
+      <div class="kv"><span class="k" id="k-elapsed">Elapsed</span><span class="v" id="kv-elapsed">—</span></div>
+      <div class="kv"><span class="k" id="k-total">Total</span><span class="v" id="kv-total">—</span></div>
       <div class="kv"><span class="k">ETA</span><span class="v" id="kv-eta">—</span></div>
-      <div class="kv"><span class="k">Frame</span><span class="v" id="kv-frame">—</span></div>
+      <div class="kv"><span class="k" id="k-counter">Frame</span><span class="v" id="kv-counter">—</span></div>
     </div>
   </div>
 
-  <div class="card">
-    <h2>Now encoding</h2>
+  <div class="card" id="seg-card">
+    <h2 id="seg-title">Now encoding</h2>
     <div class="seg-line">
       <span class="idx" id="seg-idx">—</span>
       <span class="kind" id="seg-kind">—</span>
@@ -149,7 +158,7 @@
     </div>
   </div>
 
-  <div class="card">
+  <div class="card" id="output-card">
     <h2>Output</h2>
     <div class="grid2">
       <div class="kv"><span class="k">Resolution</span><span class="v" id="kv-res">—</span></div>
@@ -160,16 +169,19 @@
   </div>
 
   <div class="card">
-    <h2>ffmpeg process</h2>
+    <h2>ffmpeg processes</h2>
     <div class="grid2">
       <div class="kv"><span class="k">CPU</span><span class="v" id="kv-cpu">—</span></div>
       <div class="kv"><span class="k">Memory (RSS)</span><span class="v" id="kv-rss">—</span></div>
+      <div class="kv"><span class="k">Active workers</span><span class="v" id="kv-procs">—</span></div>
+      <div class="kv"><span class="k">In progress</span><span class="v" id="kv-inflight">—</span></div>
     </div>
   </div>
 
   <div class="card" id="err-card" style="display:none">
-    <h2>Error</h2>
+    <h2>Errors</h2>
     <div class="err" id="err-msg"></div>
+    <ul class="err-list" id="err-list"></ul>
   </div>
 
   <div class="actions">
@@ -202,71 +214,169 @@ async function loadRound() {
   } catch {}
 }
 
-let LAST_STATE = null;
+// Pick which job to display based on what's actually happening. Live job
+// always wins; otherwise the most recently active one. The two jobs share
+// most of the UI but differ in labels (frames vs clips, encoding vs
+// rendering) and in whether the cancel button works.
+function pickJob(finalise, batch) {
+  const fState = finalise.state || "idle";
+  const bState = batch.state || "idle";
+  const liveOrder = { encoding: 3, running: 3, error: 1, cancelled: 1, done: 1, idle: 0 };
+  const fScore = liveOrder[fState] || 0;
+  const bScore = liveOrder[bState] || 0;
+  if (fScore === 0 && bScore === 0) return { kind: "idle", source: finalise };
+  // Prefer the running one. If both running (rare), prefer batch (it's
+  // typically what the user just kicked off). If neither running, prefer
+  // the one with the most recent started_at.
+  if (bState === "running" && fState !== "encoding") return { kind: "batch", source: batch };
+  if (fState === "encoding") return { kind: "finalise", source: finalise };
+  // Neither live — pick most recent.
+  const fAt = finalise.started_at || 0;
+  const bAt = batch.started_at || 0;
+  if (bAt > fAt) return { kind: "batch", source: batch };
+  return { kind: "finalise", source: finalise };
+}
 
 async function refresh() {
-  let s;
+  let finalise = { state: "idle" };
+  let batch = { state: "idle" };
   try {
-    s = await fetch("/api/finalise/status").then(r => r.json());
+    [finalise, batch] = await Promise.all([
+      fetch("/api/finalise/status").then(r => r.json()),
+      fetch("/api/render-all/status").then(r => r.json()),
+    ]);
   } catch {
     return;
   }
 
+  const job = pickJob(finalise, batch);
+  const s = job.source;
+  const isBatch = job.kind === "batch";
+  const isFinal = job.kind === "finalise";
+
+  document.getElementById("page-title").textContent =
+      isBatch ? "Re-rendering trims" :
+      isFinal ? "Final video" :
+      "Job progress";
+
   const pill = document.getElementById("state-pill");
-  pill.className = "state-pill " + s.state;
-  pill.textContent = s.state;
+  pill.className = "state-pill " + (s.state || "idle");
+  pill.textContent = s.state || "idle";
 
   const pct = (s.percent != null) ? s.percent : 0;
   document.getElementById("bar-fill").style.width = (pct * 100).toFixed(1) + "%";
   setText("pct", (s.percent != null) ? `${(pct * 100).toFixed(1)}%` : "—");
 
-  const speedTxt = (s.speed ? `${s.speed.toFixed(2)}×` : "") +
-                   (s.fps ? `  ·  ${Math.round(s.fps)} fps` : "");
-  setText("speed-fps", speedTxt);
+  // Speed/fps line: only meaningful for the finalise concat-copy phase.
+  // For the batch, show "N workers" if >1 active.
+  if (isBatch) {
+    const inflight = (s.in_progress || []).length;
+    const procs = s.n_procs || 0;
+    setText("speed-fps", procs ? `${procs} ffmpeg ${procs === 1 ? "process" : "processes"}` : "");
+  } else {
+    const speedTxt = (s.speed ? `${s.speed.toFixed(2)}×` : "") +
+                     (s.fps ? `  ·  ${Math.round(s.fps)} fps` : "");
+    setText("speed-fps", speedTxt);
+  }
 
   setText("kv-elapsed", fmt_time(s.elapsed_s));
-  setText("kv-total", fmt_time(s.total_s));
+  setText("kv-total", isBatch ? "—" : fmt_time(s.total_s));
   setText("kv-eta", fmt_time(s.eta_s));
-  setText("kv-frame", s.frame != null ? s.frame.toLocaleString() : "—");
 
-  // Segment
-  if (s.segment_index && s.segment_total) {
-    setText("seg-idx", `${s.segment_index} / ${s.segment_total}`);
+  // The "frame" slot doubles as the clip counter for batch jobs.
+  if (isBatch) {
+    document.getElementById("k-counter").textContent = "Clips done";
+    const done = (s.completed || 0) + (s.errors || 0);
+    setText("kv-counter", `${done} / ${s.total || 0}`);
   } else {
-    setText("seg-idx", "—");
+    document.getElementById("k-counter").textContent = "Frame";
+    setText("kv-counter", s.frame != null ? s.frame.toLocaleString() : "—");
   }
-  setText("seg-kind", s.segment_kind || "—");
-  setText("seg-label", s.segment_label || "—");
 
-  // Canvas
-  if (s.canvas) {
-    setText("kv-res", `${s.canvas.width} × ${s.canvas.height}`);
-    const fps = typeof s.canvas.fps === "number" ? s.canvas.fps.toFixed(2).replace(/\.?0+$/, "") : s.canvas.fps_str;
+  // Segment / current item
+  if (isBatch) {
+    document.getElementById("seg-title").textContent = "Now rendering";
+    const inflight = s.in_progress || [];
+    if (inflight.length) {
+      setText("seg-idx", `${(s.completed || 0) + (s.errors || 0) + 1} / ${s.total || 0}`);
+      setText("seg-kind", "clip");
+      setText("seg-label", inflight.join("  ·  "));
+    } else if (s.state === "running") {
+      setText("seg-idx", "—");
+      setText("seg-kind", "—");
+      setText("seg-label", "starting…");
+    } else {
+      setText("seg-idx", "—");
+      setText("seg-kind", "—");
+      setText("seg-label", s.current_label || "—");
+    }
+  } else {
+    document.getElementById("seg-title").textContent = "Now encoding";
+    if (s.segment_index && s.segment_total) {
+      setText("seg-idx", `${s.segment_index} / ${s.segment_total}`);
+    } else {
+      setText("seg-idx", "—");
+    }
+    setText("seg-kind", s.segment_kind || "—");
+    setText("seg-label", s.segment_label || "—");
+  }
+
+  // Output canvas spec — present in both jobs.
+  const cv = s.canvas;
+  if (cv) {
+    setText("kv-res", `${cv.width} × ${cv.height}`);
+    const fps = typeof cv.fps === "number"
+        ? cv.fps.toFixed(2).replace(/\.?0+$/, "")
+        : cv.fps_str;
     setText("kv-fps", `${fps} fps`);
-    setText("kv-pix", s.canvas.pix_fmt);
-    setText("kv-profile", s.canvas.profile);
+    setText("kv-pix", cv.pix_fmt);
+    setText("kv-profile", cv.profile);
   }
 
+  // ffmpeg process resources.
   setText("kv-cpu", s.cpu_percent != null ? `${s.cpu_percent.toFixed(1)} %` : "—");
   setText("kv-rss", s.rss_mb != null ? `${s.rss_mb.toFixed(0)} MB` : "—");
-
-  // Error message
-  const errCard = document.getElementById("err-card");
-  if (s.state === "error" || s.state === "cancelled") {
-    errCard.style.display = "";
-    document.getElementById("err-msg").textContent = s.message || s.state;
+  setText("kv-procs", s.n_procs != null ? s.n_procs : "—");
+  if (isBatch) {
+    const inflight = s.in_progress || [];
+    setText("kv-inflight", inflight.length ? inflight.join(", ") : "—");
   } else {
-    errCard.style.display = "none";
+    setText("kv-inflight", "—");
   }
 
-  // Buttons
-  const cancelBtn = document.getElementById("btn-cancel");
-  cancelBtn.disabled = s.state !== "encoding";
-  const openBtn = document.getElementById("btn-open");
-  const ready = (s.state === "done" || s.state === "idle") && s.exists;
-  openBtn.style.display = ready ? "" : "none";
+  // Error display.
+  const errCard = document.getElementById("err-card");
+  const errList = document.getElementById("err-list");
+  errList.innerHTML = "";
+  let showErr = false;
+  if (isFinal && (s.state === "error" || s.state === "cancelled")) {
+    showErr = true;
+    document.getElementById("err-msg").textContent = s.message || s.state;
+  } else if (isBatch && (s.errors_list || []).length) {
+    showErr = true;
+    const n = s.errors_list.length;
+    document.getElementById("err-msg").textContent =
+        `${n} clip${n === 1 ? "" : "s"} failed:`;
+    for (const e of s.errors_list) {
+      const li = document.createElement("li");
+      li.textContent = `${e.stem} — ${e.msg}`;
+      errList.appendChild(li);
+    }
+  } else {
+    document.getElementById("err-msg").textContent = "";
+  }
+  errCard.style.display = showErr ? "" : "none";
 
-  LAST_STATE = s;
+  // Buttons. Cancel only works for an in-progress finalise (we don't have
+  // a clean cancel for the per-clip render workers — they're individual
+  // ffmpeg subprocesses without a single PID we control).
+  const cancelBtn = document.getElementById("btn-cancel");
+  cancelBtn.disabled = !(isFinal && s.state === "encoding");
+  cancelBtn.style.display = isBatch ? "none" : "";
+
+  const openBtn = document.getElementById("btn-open");
+  const finalReady = (finalise.state === "done" || finalise.state === "idle") && finalise.exists;
+  openBtn.style.display = finalReady ? "" : "none";
 }
 
 document.getElementById("btn-cancel").onclick = async () => {

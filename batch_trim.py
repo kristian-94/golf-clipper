@@ -227,8 +227,19 @@ def _card_for(data: dict, course_geom: dict | None = None):
     )
 
 
-def render_from_sidecar(meta_path: Path, raw_dir: Path, trims_dir: Path) -> str:
+def render_from_sidecar(
+    meta_path: Path,
+    raw_dir: Path,
+    trims_dir: Path,
+    canvas: dict | None = None,
+) -> str:
     """Render the trim from sidecar data, baking in the scorecard if present.
+
+    Each trim is normalised to `canvas` so all of the round's trims share
+    one codec/resolution/fps/colorspace and can be byte-copied together by
+    `finalise.py`. If `canvas` is None we compute it from `raw_dir` — but
+    callers in a loop should compute it once and pass it in (otherwise we
+    re-probe every clip on every render).
 
     Returns "ok" / "no-impact" / "no-raw".
     """
@@ -238,12 +249,17 @@ def render_from_sidecar(meta_path: Path, raw_dir: Path, trims_dir: Path) -> str:
     src = raw_dir / data["raw"]
     if not src.exists():
         return "no-raw"
+    if canvas is None:
+        # Lazy single-clip path; expensive in a loop, fine for one-off CLI use.
+        from finalise import pick_canvas_for_round
+        canvas = pick_canvas_for_round(raw_dir)
     dst = trims_dir / f"{meta_path.stem}.mp4"
     start = max(0.0, data["impact_s"] - data["pre"])
     duration = data["pre"] + data["post"]
     # Round dir is the meta dir's parent; course geom is optional.
     course_geom = load_course_geom(meta_path.parent.parent)
     render_video(src, start, duration, dst,
+                 canvas=canvas,
                  card=_card_for(data, course_geom=course_geom))
     data["trimmed_at"] = datetime.now().isoformat(timespec="seconds")
     meta_path.write_text(json.dumps(data, indent=2))
@@ -263,13 +279,21 @@ def main() -> int:
     round_dir = args.round or newest_round(args.clips_root)
     raw_dir, trims_dir, meta_dir = round_paths(round_dir)
 
+    # Compute the canvas spec once for the round so every per-clip render
+    # uses the same target (lets finalise.py concat-copy with no re-encode).
+    from finalise import pick_canvas_for_round
+    canvas = pick_canvas_for_round(raw_dir)
+    print(f"canvas: {canvas['width']}x{canvas['height']} @ {canvas['fps_str']} "
+          f"({canvas['pix_fmt']}, {canvas['primaries']}/{canvas['transfer']}/"
+          f"{canvas['matrix']})")
+
     if args.re_render:
         metas = sorted(meta_dir.glob("*.json"))
         print(f"round: {round_dir}  ({len(metas)} sidecars)")
         for i, meta_path in enumerate(metas, 1):
             print(f"[{i:>3}/{len(metas)}] {meta_path.stem}", end=" ", flush=True)
             try:
-                status = render_from_sidecar(meta_path, raw_dir, trims_dir)
+                status = render_from_sidecar(meta_path, raw_dir, trims_dir, canvas)
                 print(f"-> {status}")
             except Exception as e:
                 print(f"ERROR: {e}")
@@ -295,7 +319,7 @@ def main() -> int:
     for i, meta_path in enumerate(metas, 1):
         print(f"[{i:>3}/{len(metas)}] {meta_path.stem}", end=" ", flush=True)
         try:
-            print(f"-> {render_from_sidecar(meta_path, raw_dir, trims_dir)}")
+            print(f"-> {render_from_sidecar(meta_path, raw_dir, trims_dir, canvas)}")
         except Exception as e:
             print(f"ERROR: {e}")
     return 0
