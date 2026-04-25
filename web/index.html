@@ -118,7 +118,9 @@
       <button class="filter-btn" data-filter="approved">Approved</button>
       <button class="filter-btn" data-filter="all">All</button>
       <button id="approve-all" class="filter-btn" style="background:var(--accent);color:#0e1116;border-color:var(--accent);font-weight:600;">Approve N unmarked</button>
-      <button id="render-all" class="filter-btn" style="background:var(--strong);color:#0e1116;border-color:var(--strong);font-weight:600;">Re-render all</button>
+      <button id="render-all" class="filter-btn"
+              title="Rebuild every per-clip trim from its raw source — re-cuts the strike window and re-bakes the scorecard / hole-map overlay. Use this after changes to overlay.py or scorecard data. Doesn't touch the final video."
+              style="background:var(--strong);color:#0e1116;border-color:var(--strong);font-weight:600;">Re-render all clips</button>
     </div>
   </header>
   <main>
