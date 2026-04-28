@@ -82,7 +82,8 @@ def normalize(raw: dict) -> dict:
           ]  # ordered: fewest total strokes first (leaderboard)
         }
     """
-    pars = {h["holeNumber"]: h["par"] for h in raw["teeSelection"]["holes"]}
+    hole_src = raw.get("roundHoles") or (raw.get("teeSelection") or {}).get("holes") or []
+    pars = {h["holeNumber"]: h["par"] for h in hole_src}
     holes = [{"number": n, "par": pars[n]} for n in sorted(pars)]
 
     players: list[dict] = []
