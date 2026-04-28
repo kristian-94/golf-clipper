@@ -57,12 +57,14 @@
   }
   .tile.approved { opacity: 0.55; }
   .tile { position: relative; }
-  .edit-btn, .trash-btn {
+  .edit-btn, .trash-btn, .approve-btn, .fix-btn {
     background: rgba(22,27,34,0.85); color: var(--text);
     border: 1px solid var(--line); border-radius: 4px;
     width: 28px; height: 24px; padding: 0; cursor: pointer;
     font-size: 13px; line-height: 1;
   }
+  .approve-btn:hover { background: var(--strong); color: #fff; border-color: var(--strong); }
+  .fix-btn:hover { background: var(--weak); color: #fff; border-color: var(--weak); }
   .edit-btn:hover { background: var(--accent); color: #0e1116; }
   .trash-btn:hover { background: var(--weak); color: #fff; border-color: var(--weak); }
   .tile .slot { width: 100%; aspect-ratio: 16 / 9; background: #000; display: block; }
@@ -229,7 +231,8 @@ function makeTile(c) {
   const tile = document.createElement("div");
   tile.dataset.stem = c.stem;
   tile.onclick = (e) => {
-    if (e.target.closest(".edit-btn") || e.target.closest(".trash-btn")) return;
+    if (e.target.closest(".edit-btn") || e.target.closest(".trash-btn")
+        || e.target.closest(".approve-btn") || e.target.closest(".fix-btn")) return;
     const cur = (LAST_CLIPS.find(x => x.stem === c.stem) || c).review || "unreviewed";
     const next = cur === "needs_fix" ? "unreviewed" : "needs_fix";
     setReview(c.stem, next);
@@ -298,6 +301,21 @@ function fillTile(rec, c) {
     dot.className = "flag-dot"; dot.title = (c.reasons || []).join("; ");
     rec.meta.appendChild(dot);
   }
+  if (review !== "approved") {
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "approve-btn"; approveBtn.title = "Approve (removes from Active)";
+    approveBtn.textContent = "✓";
+    approveBtn.onclick = (e) => { e.stopPropagation(); setReview(c.stem, "approved"); };
+    rec.meta.appendChild(approveBtn);
+  }
+  if (review !== "needs_fix") {
+    const fixBtn = document.createElement("button");
+    fixBtn.className = "fix-btn"; fixBtn.title = "Mark needs fix";
+    fixBtn.textContent = "✕";
+    fixBtn.onclick = (e) => { e.stopPropagation(); setReview(c.stem, "needs_fix"); };
+    rec.meta.appendChild(fixBtn);
+  }
+
   const editBtn = document.createElement("button");
   editBtn.className = "edit-btn"; editBtn.title = "Open compare view";
   editBtn.textContent = "✎";
