@@ -52,15 +52,30 @@ def assign_hole(recorded_at: datetime, boundaries: dict[int, datetime]) -> int:
 
 
 def players_through(scores: dict, hole: int) -> list[dict]:
-    """Each player's running total **before** `hole` (i.e. holes 1..hole-1)."""
-    return [
-        {
+    """Each player's running total **before** `hole` (i.e. holes 1..hole-1).
+
+    `par_through` is the cumulative par of those same holes, so the overlay
+    can render `total − par_through` as a ±par column on each row.
+    """
+    par_by_hole = {h["number"]: h["par"] for h in scores["holes"]}
+    out = []
+    for p in scores["players"]:
+        total = 0
+        par_through = 0
+        for s in p["scores"]:
+            if s["hole"] >= hole:
+                continue
+            if s.get("strokes") is None:
+                continue
+            total += s["strokes"]
+            par_through += par_by_hole.get(s["hole"], 0)
+        out.append({
             "name": p["name"],
             "is_owner": p.get("is_owner", False),
-            "total": sum(s["strokes"] for s in p["scores"] if s["hole"] < hole),
-        }
-        for p in scores["players"]
-    ]
+            "total": total,
+            "par_through": par_through,
+        })
+    return out
 
 
 def correlate(scores: dict, sidecars: dict[str, dict]) -> dict[str, dict]:

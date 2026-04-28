@@ -28,41 +28,87 @@ from PIL import Image, ImageDraw, ImageFont
 # Position relative to the source video's pixel space.
 MARGIN = 32
 
-PAD_X = 24
-PAD_Y = 18
-ROW_GAP = 8
-HEADER_GAP = 14
-WIDTH = 260  # scoreboard column; total card width grows when a map is added
+PAD_X = 28
+PAD_Y = 22
+ROW_GAP = 10
+HEADER_GAP = 18
+WIDTH = 310          # scoreboard column; total card width grows when a map is added
 
 # Hole-map layout (only used when render_card receives `hole_map`)
-MAP_PAD = 8          # gutter between map and scoreboard
+MAP_PAD = 10         # gutter between map and scoreboard
 
-# Colors (RGBA)
-BG       = (14, 17, 22, 215)        # near-black, ~85% opaque
-BORDER   = (255, 255, 255, 30)      # very faint hairline
-ACCENT   = (88, 166, 255, 255)      # blue — matches the web UI
-TEXT     = (230, 237, 243, 255)
-MUTED    = (139, 148, 158, 255)
-OWNER    = (255, 255, 255, 255)
-RADIUS   = 14
+# Colors (RGBA). The in-game card uses BG (translucent) so the frame shows
+# through. The full-screen cards in finalise.py use BG_TOP/BG_BOT (opaque
+# gradient endpoints).
+BG        = (8, 12, 18, 170)        # translucent cool-blue-tinted dark glass
+BG_TOP    = (10, 14, 22, 255)
+BG_BOT    = (4, 6, 12, 255)
+BORDER    = (255, 255, 255, 28)
+ACCENT    = (96, 165, 250, 255)     # broadcast blue (sky-400-ish, not bootstrap)
+ACCENT2   = (74, 175, 110, 255)     # course green — secondary accent
+TEXT      = (240, 245, 250, 255)
+MUTED     = (148, 156, 165, 255)
+OWNER     = (255, 255, 255, 255)
+OWNER_BG  = (96, 165, 250, 38)      # soft blue wash behind owner row
+UNDER_PAR = (96, 165, 250, 255)     # birdie/par → blue
+OVER_PAR  = (232, 120, 110, 255)    # triple+ → soft red
+RADIUS    = 16
 
-FONT_PATHS = [
-    "/System/Library/Fonts/HelveticaNeue.ttc",
-    "/System/Library/Fonts/Helvetica.ttc",
-    "/Library/Fonts/Arial.ttf",
+# Pillow's `truetype` accepts variable fonts; we apply a weight via
+# set_variation_by_name when the font supports it (SF Pro / SF Compact do).
+# Order: SF Compact (display, scoreboard-y) → SF Pro → Helvetica fallback.
+FONT_CANDIDATES = [
+    ("/System/Library/Fonts/SFCompact.ttf", "variable"),
+    ("/System/Library/Fonts/SFNS.ttf", "variable"),
+    ("/System/Library/Fonts/HelveticaNeue.ttc", "ttc"),
+    ("/System/Library/Fonts/Helvetica.ttc", "ttc"),
+    ("/Library/Fonts/Arial.ttf", "plain"),
 ]
 
 
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    for path in FONT_PATHS:
-        if Path(path).exists():
-            try:
-                # HelveticaNeue.ttc index 1 ~ bold; 0 ~ regular. Best-effort.
-                idx = 1 if bold and path.endswith(".ttc") else 0
+    for path, kind in FONT_CANDIDATES:
+        if not Path(path).exists():
+            continue
+        try:
+            if kind == "ttc":
+                idx = 1 if bold else 0
                 return ImageFont.truetype(path, size, index=idx)
-            except OSError:
-                continue
+            font = ImageFont.truetype(path, size)
+            if kind == "variable":
+                # SF variable fonts expose named instances like "Bold",
+                # "Semibold", "Regular". Pillow raises if the name isn't
+                # found, so guard each call.
+                try:
+                    font.set_variation_by_name("Bold" if bold else "Regular")
+                except (OSError, ValueError):
+                    pass
+            return font
+        except OSError:
+            continue
     return ImageFont.load_default()
+
+
+def _vgradient(w: int, h: int, top: tuple, bot: tuple) -> Image.Image:
+    """Vertical RGBA gradient — used as the card body so it doesn't read flat."""
+    grad = Image.new("RGBA", (w, h), top)
+    px = grad.load()
+    for y in range(h):
+        t = y / max(1, h - 1)
+        r = round(top[0] + (bot[0] - top[0]) * t)
+        g = round(top[1] + (bot[1] - top[1]) * t)
+        b = round(top[2] + (bot[2] - top[2]) * t)
+        a = round(top[3] + (bot[3] - top[3]) * t)
+        for x in range(w):
+            px[x, y] = (r, g, b, a)
+    return grad
+
+
+def _rounded_mask(w: int, h: int, radius: int) -> Image.Image:
+    """L-mode mask of a rounded rectangle — used to clip the gradient body."""
+    m = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=255)
+    return m
 
 
 def render_card(
@@ -71,20 +117,32 @@ def render_card(
     players: list[dict],
     shot: tuple[int, int] | None = None,
     hole_map: Image.Image | None = None,
+    scale: float = 1.0,
 ) -> Image.Image:
-    """Build a transparent RGBA card. `players` is leaderboard-ordered.
+    """Build a translucent RGBA card. `players` is leaderboard-ordered.
 
-    `shot` is an optional (index, total) tuple — only set when clip count
-    for the hole matched the owner's strokes for that hole.
-
-    `hole_map` is an optional pre-rendered RGBA image of the hole geometry
-    (from `course_map.render_hole_map`). When supplied, it's composited as a
-    column on the left of the scoreboard and the card grows accordingly.
+    Inline header ("HOLE 7 · PAR 4 ... SHOT 2/4"), divider, then one row per
+    player: name | ±par | total. Background is a single semi-transparent
+    fill — the frame shows through, which reads better in motion than an
+    opaque gradient.
     """
-    f_header = _font(22, bold=True)
-    f_meta   = _font(14, bold=False)
-    f_name   = _font(18, bold=True)
-    f_score  = _font(20, bold=True)
+    s = scale
+    px = lambda v: max(1, round(v * s))
+    pad_x = px(PAD_X); pad_y = px(PAD_Y)
+    row_gap = px(ROW_GAP); header_gap = px(HEADER_GAP)
+    width = px(WIDTH); map_pad = px(MAP_PAD); radius = px(RADIUS)
+
+    f_header = _font(px(22), bold=True)
+    f_meta   = _font(px(14), bold=False)
+    f_name   = _font(px(19), bold=True)
+    f_score  = _font(px(22), bold=True)
+    f_diff   = _font(px(15), bold=True)
+
+    if hole_map is not None and s != 1.0:
+        hole_map = hole_map.resize(
+            (px(hole_map.width), px(hole_map.height)),
+            Image.LANCZOS,
+        )
 
     tmp = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(tmp)
@@ -96,19 +154,16 @@ def render_card(
     header_h = text_h(f_header)
     row_h    = max(text_h(f_name), text_h(f_score))
     sb_height = (
-        PAD_Y
+        pad_y
         + header_h
-        + HEADER_GAP
+        + header_gap
         + row_h * len(players)
-        + ROW_GAP * max(0, len(players) - 1)
-        + PAD_Y
+        + row_gap * max(0, len(players) - 1)
+        + pad_y
     )
 
-    # Map column width is just the map's width + a small gap to the scoreboard.
-    # No box around the map — it floats freely on the left.
-    map_col_w = (hole_map.width + MAP_PAD) if hole_map else 0
-    total_w = map_col_w + WIDTH
-    # Total card height fits whichever is taller — the scoreboard box or the map.
+    map_col_w = (hole_map.width + map_pad) if hole_map else 0
+    total_w = map_col_w + width
     total_h = max(sb_height, hole_map.height) if hole_map else sb_height
 
     img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
@@ -116,51 +171,82 @@ def render_card(
 
     sb_left = map_col_w
     sb_right = total_w
-    sb_top = 0  # scoreboard anchored to the top — the card itself is top-right pinned
+    sb_top = 0
 
-    # Box wraps the scoreboard column only — the map is unboxed.
+    # Single semi-transparent fill — translucent enough to see the frame
+    # through it. BG carries an alpha of ~150 (see constants).
     draw.rounded_rectangle(
         (sb_left, sb_top, sb_right - 1, sb_top + sb_height - 1),
-        radius=RADIUS, fill=BG, outline=BORDER, width=1,
+        radius=radius, fill=BG, outline=BORDER, width=1,
     )
 
     if hole_map:
-        # Top-align the map with the scoreboard so the visual top edge is shared.
         img.paste(hole_map, (0, 0), hole_map)
 
-    bar_top = sb_top + PAD_Y - 2
-    bar_bot = sb_top + PAD_Y + header_h + 2
+    # Small gold accent bar to the left of the header.
+    bar_top = sb_top + pad_y - px(2)
+    bar_bot = sb_top + pad_y + header_h + px(2)
     draw.rounded_rectangle(
-        (sb_left + PAD_X - 10, bar_top, sb_left + PAD_X - 6, bar_bot),
-        radius=2, fill=ACCENT,
+        (sb_left + pad_x - px(10), bar_top, sb_left + pad_x - px(6), bar_bot),
+        radius=px(2), fill=ACCENT,
     )
 
-    y = sb_top + PAD_Y
-    head_left = sb_left + PAD_X
+    # --- Inline header: HOLE 7 · PAR 4   …   SHOT 2/4
+    y = sb_top + pad_y
+    head_left = sb_left + pad_x
     draw.text((head_left, y), f"HOLE {hole}", font=f_header, fill=TEXT)
     hole_w = draw.textlength(f"HOLE {hole}", font=f_header)
     sep = "   ·   "
-    draw.text((head_left + hole_w, y + 2), sep, font=f_meta, fill=MUTED)
+    draw.text((head_left + hole_w, y + px(2)), sep, font=f_meta, fill=MUTED)
     sep_w = draw.textlength(sep, font=f_meta)
-    draw.text((head_left + hole_w + sep_w, y), f"PAR {par}", font=f_header, fill=ACCENT)
+    draw.text((head_left + hole_w + sep_w, y), f"PAR {par}",
+              font=f_header, fill=ACCENT)
     if shot:
         idx, total = shot
         tag = f"SHOT {idx}/{total}"
         tag_w = draw.textlength(tag, font=f_meta)
-        draw.text((sb_right - PAD_X - tag_w, y + 4), tag, font=f_meta, fill=MUTED)
+        draw.text((sb_right - pad_x - tag_w, y + px(4)),
+                  tag, font=f_meta, fill=MUTED)
 
-    y += header_h + HEADER_GAP // 2
-    draw.line((sb_left + PAD_X, y, sb_right - PAD_X, y), fill=BORDER, width=1)
-    y += HEADER_GAP // 2
+    y += header_h + header_gap // 2
+    draw.line((sb_left + pad_x, y, sb_right - pad_x, y),
+              fill=BORDER, width=1)
+    y += header_gap // 2
 
+    # --- Player rows: name | ±par | total
+    score_col_w = px(46)
     for i, p in enumerate(players):
         if i:
-            y += ROW_GAP
+            y += row_gap
         name_color = OWNER if p.get("is_owner") else TEXT
-        draw.text((sb_left + PAD_X, y), p["name"], font=f_name, fill=name_color)
+
+        # Name
+        draw.text((sb_left + pad_x, y), p["name"],
+                  font=f_name, fill=name_color)
+
+        # Total (far right)
         score = str(p["total"])
         score_w = draw.textlength(score, font=f_score)
-        draw.text((sb_right - PAD_X - score_w, y - 2), score, font=f_score, fill=name_color)
+        draw.text((sb_right - pad_x - score_w, y - px(2)),
+                  score, font=f_score, fill=name_color)
+
+        # ±par sits between the name and the total. Sidecars without
+        # par_through (older clips) just don't render this column.
+        diff = p.get("diff")
+        if diff is None and "par_through" in p:
+            diff = p["total"] - p["par_through"]
+        if diff is not None:
+            if diff < 0:
+                diff_str, diff_color = str(diff), UNDER_PAR
+            elif diff > 0:
+                diff_str, diff_color = f"+{diff}", OVER_PAR
+            else:
+                diff_str, diff_color = "E", MUTED
+            diff_w = draw.textlength(diff_str, font=f_diff)
+            diff_x = sb_right - pad_x - score_col_w - diff_w
+            draw.text((diff_x, y + px(4)),
+                      diff_str, font=f_diff, fill=diff_color)
+
         y += row_h
 
     return img
@@ -174,6 +260,28 @@ CRF = "12"
 PRESET = "slow"
 
 
+def _probe_src_fps(path: Path) -> float | None:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True,
+    )
+    s = out.stdout.strip()
+    if not s:
+        return None
+    if "/" in s:
+        n, _, d = s.partition("/")
+        try:
+            return float(n) / float(d) if float(d) else None
+        except ValueError:
+            return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def render_video(
     raw_path: Path,
     start: float,
@@ -181,6 +289,7 @@ def render_video(
     dst: Path,
     canvas: dict,
     card: Image.Image | None = None,
+    pid_set: set | None = None,
 ) -> None:
     """Trim raw_path[start..start+duration] → dst, normalised to canvas.
 
@@ -200,14 +309,43 @@ def render_video(
     W = canvas["width"]
     H = canvas["height"]
     fps_str = canvas["fps_str"]
+    canvas_fps = float(canvas["fps"])
     pix_fmt = canvas["pix_fmt"]
     profile = canvas["profile"]
+    # Margin scales with canvas height so the card-to-edge gap stays
+    # visually constant at 1080p / 4K.
+    margin = max(MARGIN, round(MARGIN * H / 1080))
+
+    # Detect source fps. If the source is faster than the canvas (e.g. iPhone
+    # 240fps slo-mo on a 60fps canvas), we want iMovie-style behaviour: keep
+    # every frame, stretch duration to the canvas fps so it plays as actual
+    # slow motion. Without retiming, the fps filter would drop 3 of every 4
+    # frames and play at "real" speed — losing the slo-mo intent entirely.
+    src_fps = _probe_src_fps(raw_path) or canvas_fps
+    slowmo = src_fps > canvas_fps * 1.05  # small margin for 60 vs 60000/1001
+    if slowmo:
+        retime = src_fps / canvas_fps
+        retime_chain = f"setpts=PTS*{retime:.6f},"
+        # Match audio duration to the stretched video. Slo-mo audio at the
+        # source pitch sounds wrong (low-pitched), so we mute it — same as
+        # iMovie's default slo-mo behaviour. atempo can't go below 0.5 in
+        # one step, so chain factors of 0.5 until we reach the target.
+        speed = 1.0 / retime
+        factors: list[float] = []
+        while speed < 0.5:
+            factors.append(0.5); speed *= 2
+        factors.append(speed)
+        audio_extra = "," + ",".join(f"atempo={f:.6f}" for f in factors) + ",volume=0"
+    else:
+        retime_chain = ""
+        audio_extra = ""
 
     # Build the video filter chain. Lower-res clips are upscaled with Lanczos
     # and letterboxed; lower-fps clips get frame-doubled by the fps filter
     # (no interpolation — visually the clip plays at its source rate inside
     # a higher-fps container, which is what we want).
     base_chain = (
+        f"{retime_chain}"
         f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps_str},setsar=1,format={pix_fmt}"
@@ -238,16 +376,16 @@ def render_video(
                 "-i", str(png_path),
                 "-filter_complex",
                 f"[0:v]{base_chain}[base];"
-                f"[base][1:v]overlay=x=W-w-{MARGIN}:y={MARGIN}:format=auto,"
+                f"[base][1:v]overlay=x=W-w-{margin}:y={margin}:format=auto,"
                 f"format={pix_fmt}[v];"
-                f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a]",
+                f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo{audio_extra}[a]",
                 "-map", "[v]", "-map", "[a]",
             ]
         else:
             cmd += [
                 "-filter_complex",
                 f"[0:v]{base_chain}[v];"
-                f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a]",
+                f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo{audio_extra}[a]",
                 "-map", "[v]", "-map", "[a]",
             ]
         cmd += [
@@ -268,7 +406,19 @@ def render_video(
             "-movflags", "+faststart",
             str(dst),
         ]
-        subprocess.run(cmd, check=True)
+        # Popen + register PID so the server can SIGTERM only OUR ffmpegs
+        # on cancel (instead of `pgrep -x ffmpeg` which also catches an
+        # unrelated finalise running in parallel).
+        proc = subprocess.Popen(cmd)
+        if pid_set is not None:
+            pid_set.add(proc.pid)
+        try:
+            rc = proc.wait()
+        finally:
+            if pid_set is not None:
+                pid_set.discard(proc.pid)
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd)
     finally:
         if png_path:
             png_path.unlink(missing_ok=True)

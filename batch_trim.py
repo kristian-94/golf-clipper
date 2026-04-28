@@ -201,11 +201,14 @@ def detect_clip(
     return data
 
 
-def _card_for(data: dict, course_geom: dict | None = None):
+def _card_for(data: dict, course_geom: dict | None = None, scale: float = 1.0):
     """Build the overlay card from sidecar fields, or None if not enough info.
 
     `course_geom` is optional — when present and the hole has OSM geometry,
     a small map is composited on the left of the scorecard.
+
+    `scale` is passed through so the card matches the canvas resolution
+    (1.0 at 1080p, ~2.0 at 4K).
     """
     if data.get("hole") is None or not data.get("players"):
         return None
@@ -223,7 +226,7 @@ def _card_for(data: dict, course_geom: dict | None = None):
 
     return render_card(
         data["hole"], data["par"], data["players"],
-        shot=shot, hole_map=hole_map,
+        shot=shot, hole_map=hole_map, scale=scale,
     )
 
 
@@ -232,6 +235,7 @@ def render_from_sidecar(
     raw_dir: Path,
     trims_dir: Path,
     canvas: dict | None = None,
+    pid_set: set | None = None,
 ) -> str:
     """Render the trim from sidecar data, baking in the scorecard if present.
 
@@ -258,9 +262,13 @@ def render_from_sidecar(
     duration = data["pre"] + data["post"]
     # Round dir is the meta dir's parent; course geom is optional.
     course_geom = load_course_geom(meta_path.parent.parent)
+    # Card layout was tuned at 1080p. Scale every pixel-space dimension by
+    # canvas_h/1080 so the card stays the same physical fraction at 4K.
+    card_scale = max(1.0, canvas["height"] / 1080.0)
     render_video(src, start, duration, dst,
                  canvas=canvas,
-                 card=_card_for(data, course_geom=course_geom))
+                 card=_card_for(data, course_geom=course_geom, scale=card_scale),
+                 pid_set=pid_set)
     data["trimmed_at"] = datetime.now().isoformat(timespec="seconds")
     meta_path.write_text(json.dumps(data, indent=2))
     return "ok"

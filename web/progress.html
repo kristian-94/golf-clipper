@@ -367,12 +367,13 @@ async function refresh() {
   }
   errCard.style.display = showErr ? "" : "none";
 
-  // Buttons. Cancel only works for an in-progress finalise (we don't have
-  // a clean cancel for the per-clip render workers — they're individual
-  // ffmpeg subprocesses without a single PID we control).
+  // Cancel works for both jobs: finalise SIGTERMs the single ffmpeg pid,
+  // batch sets a flag (so queued workers skip) and SIGTERMs every ffmpeg.
   const cancelBtn = document.getElementById("btn-cancel");
-  cancelBtn.disabled = !(isFinal && s.state === "encoding");
-  cancelBtn.style.display = isBatch ? "none" : "";
+  const cancellable = (isFinal && s.state === "encoding") || (isBatch && s.state === "running");
+  cancelBtn.disabled = !cancellable;
+  cancelBtn.style.display = "";
+  cancelBtn.dataset.kind = isBatch ? "batch" : "finalise";
 
   const openBtn = document.getElementById("btn-open");
   const finalReady = (finalise.state === "done" || finalise.state === "idle") && finalise.exists;
@@ -380,8 +381,13 @@ async function refresh() {
 }
 
 document.getElementById("btn-cancel").onclick = async () => {
-  if (!confirm("Cancel the encode? The partial final.mp4 will be left on disk.")) return;
-  const r = await fetch("/api/finalise/cancel", { method: "POST" });
+  const kind = document.getElementById("btn-cancel").dataset.kind || "finalise";
+  const msg = kind === "batch"
+    ? "Cancel the re-render? In-flight clips will stop; already-done clips stay."
+    : "Cancel the encode? The partial final.mp4 will be left on disk.";
+  if (!confirm(msg)) return;
+  const url = kind === "batch" ? "/api/render-all/cancel" : "/api/finalise/cancel";
+  const r = await fetch(url, { method: "POST" });
   if (!r.ok) {
     const txt = await r.text();
     alert(`Cancel failed: ${r.status} ${txt}`);

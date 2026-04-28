@@ -36,7 +36,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from overlay import ACCENT, BORDER, MUTED, OWNER, TEXT, _font
+from overlay import (
+    ACCENT, ACCENT2, BG_BOT, BG_TOP, BORDER, MUTED, OVER_PAR, OWNER, OWNER_BG,
+    TEXT, UNDER_PAR, _font, _rounded_mask, _vgradient,
+)
 
 # Default per-card durations. The HTTP API can override per-render.
 DEFAULT_DURATIONS = {
@@ -163,7 +166,15 @@ def pick_canvas(infos: list[StreamInfo]) -> dict:
     """
     width = max(max(i.width, i.height) for i in infos)
     height = max(min(i.width, i.height) for i in infos)
+    # Cap canvas fps at 60. Slo-mo (240fps) clips would otherwise drag the
+    # whole round to 240fps and force a 4× upsample on every other clip.
+    # `overlay.render_video` retimes higher-fps sources with setpts so they
+    # land on the canvas as actual slow motion (à la iMovie).
     fps_pick = max(infos, key=lambda i: i.fps)
+    if fps_pick.fps > 60:
+        fps_str, fps_val = "60/1", 60.0
+    else:
+        fps_str, fps_val = fps_pick.fps_str, fps_pick.fps
     any_hdr = any(i.is_hdr() for i in infos)
     if any_hdr:
         color = {
@@ -184,8 +195,8 @@ def pick_canvas(infos: list[StreamInfo]) -> dict:
     return {
         "width": width,
         "height": height,
-        "fps_str": fps_pick.fps_str,
-        "fps": fps_pick.fps,
+        "fps_str": fps_str,
+        "fps": fps_val,
         **color,
     }
 
@@ -246,6 +257,42 @@ def _centered(draw: ImageDraw.ImageDraw, text: str, font, cx: int, cy: int,
     draw.text((cx - w // 2, cy - h // 2 - bbox[1]), text, font=font, fill=color)
 
 
+def _card_background(W: int, H: int) -> Image.Image:
+    """Full-frame card background: vertical gradient + faint vignette + gold corner brackets.
+
+    Matches the in-game overlay's tonal palette so the title/scorecard/summary
+    cards read as the same broadcast template, just at full-screen scale.
+    """
+    # Reuse overlay's gradient endpoints but force full opacity (this is RGB).
+    top = (BG_TOP[0], BG_TOP[1], BG_TOP[2], 255)
+    bot = (BG_BOT[0], BG_BOT[1], BG_BOT[2], 255)
+    grad = _vgradient(W, H, top, bot).convert("RGB")
+
+    draw = ImageDraw.Draw(grad)
+    s = H / 1080.0
+    # Gold corner brackets — broadcast scoreboard cliché, but it works.
+    bw = int(2 * s)
+    arm = int(64 * s)
+    inset = int(48 * s)
+    pts = [
+        # top-left
+        ((inset, inset), (inset + arm, inset), (inset, inset), (inset, inset + arm)),
+        # top-right
+        ((W - inset - arm, inset), (W - inset, inset),
+         (W - inset, inset), (W - inset, inset + arm)),
+        # bottom-left
+        ((inset, H - inset), (inset + arm, H - inset),
+         (inset, H - inset - arm), (inset, H - inset)),
+        # bottom-right
+        ((W - inset - arm, H - inset), (W - inset, H - inset),
+         (W - inset, H - inset - arm), (W - inset, H - inset)),
+    ]
+    for p1, p2, p3, p4 in pts:
+        draw.line([p1, p2], fill=ACCENT[:3], width=bw)
+        draw.line([p3, p4], fill=ACCENT[:3], width=bw)
+    return grad
+
+
 def render_title_card(
     canvas: dict,
     course: str | None,
@@ -253,32 +300,42 @@ def render_title_card(
     players: list[str],
 ) -> Image.Image:
     W, H = canvas["width"], canvas["height"]
-    img = Image.new("RGB", (W, H), (14, 17, 22))
+    img = _card_background(W, H)
     draw = ImageDraw.Draw(img)
 
-    # Sizes scale with canvas height so 1080p and 4K both look balanced.
     s = H / 1080.0
-    f_course = _font(int(96 * s), bold=True)
-    f_date = _font(int(40 * s), bold=False)
-    f_players = _font(int(46 * s), bold=False)
+    f_eyebrow = _font(int(28 * s), bold=True)
+    f_course = _font(int(140 * s), bold=True)
+    f_date = _font(int(42 * s), bold=False)
+    f_players_label = _font(int(22 * s), bold=True)
+    f_players = _font(int(48 * s), bold=True)
 
     course_text = (course or "Round").upper()
-    date_text = _round_label(round_name)
-    players_text = "  ·  ".join(players) if players else ""
+    date_text = _round_label(round_name).upper()
+    players_text = "   ·   ".join(p.upper() for p in players) if players else ""
 
-    _centered(draw, course_text, f_course, W // 2, int(H * 0.32), TEXT[:3])
+    # Eyebrow above the course name — gives the title some breathing room.
+    _centered(draw, "ROUND HIGHLIGHTS", f_eyebrow, W // 2, int(H * 0.22),
+              ACCENT[:3])
 
-    rule_w = int(W * 0.14)
-    rule_h = max(2, int(4 * s))
-    rule_y = int(H * 0.44)
+    # Course name — the hero. Slight letter-spacing emulated by uppercasing
+    # and using a heavy weight; PIL doesn't expose tracking directly.
+    _centered(draw, course_text, f_course, W // 2, int(H * 0.40), TEXT[:3])
+
+    # Gold rule + date stamp.
+    rule_w = int(W * 0.12)
+    rule_h = max(2, int(3 * s))
+    rule_y = int(H * 0.54)
     draw.rectangle(
         ((W - rule_w) // 2, rule_y, (W + rule_w) // 2, rule_y + rule_h),
         fill=ACCENT[:3],
     )
+    _centered(draw, date_text, f_date, W // 2, int(H * 0.60), MUTED[:3])
 
-    _centered(draw, date_text, f_date, W // 2, int(H * 0.52), MUTED[:3])
     if players_text:
-        _centered(draw, players_text, f_players, W // 2, int(H * 0.66),
+        _centered(draw, "PLAYERS", f_players_label, W // 2, int(H * 0.74),
+                  ACCENT2[:3])
+        _centered(draw, players_text, f_players, W // 2, int(H * 0.80),
                   TEXT[:3])
     return img
 
@@ -286,7 +343,7 @@ def render_title_card(
 def render_scorecard_card(canvas: dict, scores: dict | None) -> Image.Image:
     """Full 18-hole scorecard. Falls back to a placeholder if no scores."""
     W, H = canvas["width"], canvas["height"]
-    img = Image.new("RGB", (W, H), (14, 17, 22))
+    img = _card_background(W, H)
     draw = ImageDraw.Draw(img)
     s = H / 1080.0
 
@@ -298,37 +355,80 @@ def render_scorecard_card(canvas: dict, scores: dict | None) -> Image.Image:
     holes = scores["holes"]
     players = scores["players"]
 
-    # Header
-    f_title = _font(int(64 * s), bold=True)
-    title = (scores.get("course") or "Scorecard").upper()
-    _centered(draw, title, f_title, W // 2, int(H * 0.10), TEXT[:3])
+    # Empty rounds (no holes logged yet, or no players) fall back to the
+    # same placeholder rather than dividing by zero in the cell-width math.
+    if not holes or not players:
+        f = _font(int(56 * s), bold=True)
+        _centered(draw, "Scorecard unavailable", f, W // 2, H // 2, MUTED[:3])
+        return img
 
-    # Table layout: label col + 18 hole cols + total col, centered horizontally.
-    side_margin = int(W * 0.04)
+    # Header — eyebrow + title + accent rule, mirrors the title card.
+    f_eyebrow = _font(int(22 * s), bold=True)
+    f_title = _font(int(72 * s), bold=True)
+    _centered(draw, "SCORECARD", f_eyebrow, W // 2, int(H * 0.07), ACCENT[:3])
+    title = (scores.get("course") or "Scorecard").upper()
+    _centered(draw, title, f_title, W // 2, int(H * 0.13), TEXT[:3])
+    rule_w = int(W * 0.08); rule_h = max(2, int(3 * s))
+    rule_y = int(H * 0.19)
+    draw.rectangle(
+        ((W - rule_w) // 2, rule_y, (W + rule_w) // 2, rule_y + rule_h),
+        fill=ACCENT[:3],
+    )
+
+    # Table layout
+    side_margin = int(W * 0.05)
     grid_w = W - 2 * side_margin
-    label_col_w = int(grid_w * 0.16)
-    total_col_w = int(grid_w * 0.07)
+    label_col_w = int(grid_w * 0.17)
+    total_col_w = int(grid_w * 0.08)
     hole_cols_w = grid_w - label_col_w - total_col_w
     cell_w = hole_cols_w // len(holes)
     table_left = side_margin + (hole_cols_w - cell_w * len(holes)) // 2
 
-    table_top = int(H * 0.22)
-    table_bot = int(H * 0.92)
-    rows = 2 + len(players)  # HOLE row, PAR row, then one row per player
+    table_top = int(H * 0.26)
+    table_bot = int(H * 0.93)
+    rows = 2 + len(players)
     row_h = (table_bot - table_top) // rows
 
-    f_label = _font(int(32 * s), bold=True)
-    f_head = _font(int(30 * s), bold=True)
-    f_par = _font(int(32 * s), bold=True)
-    f_val = _font(int(34 * s), bold=True)
+    f_label = _font(int(30 * s), bold=True)
+    f_head  = _font(int(28 * s), bold=True)
+    f_par   = _font(int(32 * s), bold=True)
+    f_val   = _font(int(34 * s), bold=True)
+    f_total = _font(int(38 * s), bold=True)
 
     def cell(text: str, font, x: int, y: int, w: int, h: int, color) -> None:
         b = draw.textbbox((0, 0), text, font=font)
-        tw, th = b[2] - b[0], b[3] - b[1]
+        tw = b[2] - b[0]; th = b[3] - b[1]
         draw.text((x + (w - tw) // 2, y + (h - th) // 2 - b[1]),
                   text, font=font, fill=color)
 
     total_x = table_left + label_col_w + cell_w * len(holes)
+    table_right = total_x + total_col_w
+
+    # Tints: card body is RGB, so we pre-blend against the average BG colour
+    # rather than passing RGBA fills (which PIL would silently treat as opaque).
+    bg_mid = tuple((BG_TOP[i] + BG_BOT[i]) // 2 for i in range(3))
+
+    def tint(rgb: tuple, a: int) -> tuple:
+        # Alpha 0..255, blended over bg_mid.
+        return tuple(round(bg_mid[i] + (rgb[i] - bg_mid[i]) * a / 255)
+                     for i in range(3))
+
+    owner_band = tint(ACCENT[:3], 56)     # subtle gold wash
+    par_band   = tint(ACCENT2[:3], 36)    # whisper of course-green
+    stripe     = tint((255, 255, 255), 8)  # near-invisible zebra
+
+    # Striped row backgrounds for player rows so the eye can track across 18 cols.
+    for i in range(len(players)):
+        y = table_top + (2 + i) * row_h
+        is_owner = players[i].get("is_owner")
+        if is_owner:
+            draw.rectangle((table_left, y, table_right, y + row_h), fill=owner_band)
+            # gold left edge bar
+            draw.rectangle((table_left - int(8 * s), y,
+                            table_left - int(2 * s), y + row_h),
+                           fill=ACCENT[:3])
+        elif i % 2:
+            draw.rectangle((table_left, y, table_right, y + row_h), fill=stripe)
 
     # HOLE row
     y = table_top
@@ -339,29 +439,39 @@ def render_scorecard_card(canvas: dict, scores: dict | None) -> Image.Image:
              MUTED[:3])
     cell("TOT", f_label, total_x, y, total_col_w, row_h, MUTED[:3])
 
-    # PAR row
+    # PAR row — gets a dim band so it visually separates from the player rows.
     y += row_h
-    cell("PAR", f_label, table_left, y, label_col_w, row_h, MUTED[:3])
+    draw.rectangle((table_left, y, table_right, y + row_h), fill=par_band)
+    cell("PAR", f_label, table_left, y, label_col_w, row_h, ACCENT2[:3])
     par_total = 0
     for i, hole in enumerate(holes):
         cell(str(hole["par"]), f_par,
              table_left + label_col_w + i * cell_w, y, cell_w, row_h,
-             ACCENT[:3])
+             ACCENT2[:3])
         par_total += hole["par"]
-    cell(str(par_total), f_par, total_x, y, total_col_w, row_h, ACCENT[:3])
+    cell(str(par_total), f_par, total_x, y, total_col_w, row_h, ACCENT2[:3])
 
     # Divider under PAR
     line_y = y + row_h
-    draw.line((table_left, line_y,
-               total_x + total_col_w, line_y),
-              fill=BORDER[:3], width=max(1, int(2 * s)))
+    draw.line((table_left, line_y, table_right, line_y),
+              fill=ACCENT[:3], width=max(1, int(2 * s)))
+
+    # Score-type palette tuned for high-handicap golfers: par is celebrated
+    # like a birdie, bogey is treated as a "good" hole, doubles are the
+    # baseline, triples warn, quad+ are flagged. Five distinct treatments
+    # so the eye can pick a hole's quality from across the room.
+    BIRDIE_FG  = (10, 22, 38)            # near-black text on filled blue pill
+    BIRDIE_BG  = ACCENT[:3]              # filled blue (only score type with a chip)
+    PAR_FG     = ACCENT[:3]              # blue text, no chip
+    BOGEY_FG   = ACCENT2[:3]             # course-green
+    DOUBLE_FG  = (240, 180, 96)          # amber
+    TRIPLE_FG  = OVER_PAR[:3]            # soft red — covers triple AND worse
 
     # Player rows
     for p in players:
         y += row_h
         name_color = OWNER[:3] if p.get("is_owner") else TEXT[:3]
-        cell(p["name"], f_label, table_left, y, label_col_w, row_h,
-             name_color)
+        cell(p["name"], f_label, table_left, y, label_col_w, row_h, name_color)
         strokes_by_hole = {sc["hole"]: sc.get("strokes") for sc in p["scores"]}
         total = 0
         for i, hole in enumerate(holes):
@@ -370,15 +480,62 @@ def render_scorecard_card(canvas: dict, scores: dict | None) -> Image.Image:
             color = name_color
             if v is not None:
                 diff = v - hole["par"]
+                cx = table_left + label_col_w + i * cell_w
+                # Pill geometry — used for birdie (filled) and par (outline).
+                # Centred chip ~80% of cell width, square so it reads as a coin
+                # instead of a vertical ellipse.
+                chip_d = min(cell_w, row_h) - int(20 * s)
+                cx_mid = cx + cell_w // 2
+                cy_mid = y + row_h // 2
+                pill_box = (cx_mid - chip_d // 2, cy_mid - chip_d // 2,
+                            cx_mid + chip_d // 2, cy_mid + chip_d // 2)
                 if diff < 0:
-                    color = ACCENT[:3]      # under par
-                elif diff > 1:
-                    color = MUTED[:3]       # double-bogey or worse
+                    draw.ellipse(pill_box, fill=BIRDIE_BG)
+                    color = BIRDIE_FG
+                elif diff == 0:
+                    color = PAR_FG
+                elif diff == 1:
+                    color = BOGEY_FG
+                elif diff == 2:
+                    color = DOUBLE_FG
+                else:
+                    color = TRIPLE_FG
                 total += v
             cell(txt, f_val,
-                 table_left + label_col_w + i * cell_w, y, cell_w, row_h,
-                 color)
-        cell(str(total), f_val, total_x, y, total_col_w, row_h, name_color)
+                 table_left + label_col_w + i * cell_w, y, cell_w, row_h, color)
+        cell(str(total), f_total, total_x, y, total_col_w, row_h, name_color)
+
+    # Legend across the bottom — explains the colour bucketing without
+    # cluttering the table itself.
+    legend_y = table_bot + int(20 * s)
+    if legend_y + int(50 * s) < H:
+        f_legend = _font(int(20 * s), bold=True)
+        items = [
+            ("BIRDIE",  BIRDIE_FG, BIRDIE_BG),    # filled chip — only one
+            ("PAR",     PAR_FG, None),
+            ("BOGEY",   BOGEY_FG, None),
+            ("DOUBLE",  DOUBLE_FG, None),
+            ("TRIPLE+", TRIPLE_FG, None),
+        ]
+        gap = int(36 * s)
+        chip_d = int(28 * s)
+        # Pre-measure widths to centre the legend strip.
+        widths = []
+        for label, _, _ in items:
+            tw = draw.textlength(label, font=f_legend)
+            widths.append(chip_d + int(8 * s) + int(tw))
+        total_w = sum(widths) + gap * (len(items) - 1)
+        x = (W - total_w) // 2
+        for (label, fg, bg), w in zip(items, widths):
+            chip_y = legend_y + int(8 * s)
+            chip_box = (x, chip_y, x + chip_d, chip_y + chip_d)
+            if bg is not None:
+                draw.ellipse(chip_box, fill=bg)
+            else:
+                draw.ellipse(chip_box, outline=fg, width=max(2, int(2 * s)))
+            draw.text((x + chip_d + int(8 * s), legend_y + int(10 * s)),
+                      label, font=f_legend, fill=MUTED[:3])
+            x += w + gap
 
     return img
 
@@ -426,7 +583,7 @@ def _player_breakdown(player: dict, holes: list[dict]) -> dict:
 def render_summary_card(canvas: dict, scores: dict | None) -> Image.Image:
     """Per-player round summary: total / vs par / putts / score-type counts."""
     W, H = canvas["width"], canvas["height"]
-    img = Image.new("RGB", (W, H), (14, 17, 22))
+    img = _card_background(W, H)
     draw = ImageDraw.Draw(img)
     s = H / 1080.0
 
@@ -437,58 +594,132 @@ def render_summary_card(canvas: dict, scores: dict | None) -> Image.Image:
 
     holes = scores["holes"]
     players = scores["players"]
+    if not players:
+        f = _font(int(56 * s), bold=True)
+        _centered(draw, "Summary unavailable", f, W // 2, H // 2, MUTED[:3])
+        return img
     breakdowns = [(_player_breakdown(p, holes), p) for p in players]
 
-    f_title = _font(int(56 * s), bold=True)
-    _centered(draw, "ROUND SUMMARY", f_title, W // 2, int(H * 0.10), TEXT[:3])
-
-    # Accent rule under the heading
+    # Header
+    f_eyebrow = _font(int(22 * s), bold=True)
+    f_title = _font(int(76 * s), bold=True)
+    _centered(draw, "FINAL", f_eyebrow, W // 2, int(H * 0.07), ACCENT[:3])
+    _centered(draw, "ROUND SUMMARY", f_title, W // 2, int(H * 0.13), TEXT[:3])
     rule_w = int(W * 0.10); rule_h = max(2, int(3 * s))
-    rule_y = int(H * 0.16)
+    rule_y = int(H * 0.19)
     draw.rectangle(
         ((W - rule_w) // 2, rule_y, (W + rule_w) // 2, rule_y + rule_h),
         fill=ACCENT[:3],
     )
 
-    # Layout: a column per player, side-by-side, vertically centered.
+    # Card-per-player layout — each player gets a panel with the same gradient
+    # body as the in-game card, gold edge bar on owner, big score, stats grid.
     n = len(players)
     side_margin = int(W * 0.06)
-    col_w = (W - 2 * side_margin) // n
-    col_top = int(H * 0.26)
+    gap = int(W * 0.02)
+    col_w = (W - 2 * side_margin - gap * (n - 1)) // n
+    col_top = int(H * 0.27)
+    col_bot = int(H * 0.93)
+    col_h = col_bot - col_top
+    radius = int(20 * s)
 
-    f_name = _font(int(48 * s), bold=True)
-    f_score = _font(int(180 * s), bold=True)
-    f_diff = _font(int(40 * s), bold=False)
-    f_label = _font(int(22 * s), bold=False)
-    f_stat = _font(int(36 * s), bold=True)
+    # Type sized off panel height so the layout always fits, not screen height.
+    sp = col_h / 1080.0  # panel-relative scale
+    f_name = _font(int(60 * sp), bold=True)
+    f_owner_tag = _font(int(24 * sp), bold=True)
+    f_score = _font(int(360 * sp), bold=True)
+    f_diff = _font(int(72 * sp), bold=True)
+    f_par = _font(int(32 * sp), bold=False)
+    f_label = _font(int(24 * sp), bold=True)
+    f_stat = _font(int(56 * sp), bold=True)
+
+    # Vertical anchor points as fractions of panel height — guarantees fit.
+    name_y_f   = 0.10
+    score_y_f  = 0.36
+    diff_y_f   = 0.66
+    par_y_f    = 0.74
+    stats_y_f  = 0.86
 
     for i, (b, p) in enumerate(breakdowns):
-        cx = side_margin + col_w * i + col_w // 2
-        name_color = OWNER[:3] if p.get("is_owner") else TEXT[:3]
-        y = col_top
-        _centered(draw, p["name"].upper(), f_name, cx, y, name_color)
+        col_x = side_margin + i * (col_w + gap)
+        is_owner = p.get("is_owner")
+        name_color = OWNER[:3] if is_owner else TEXT[:3]
 
-        # Big score number
-        y = int(H * 0.42)
-        _centered(draw, str(b["strokes"]), f_score, cx, y, name_color)
+        # Panel background: same gradient as the overlay card body.
+        panel = _vgradient(col_w, col_h,
+                           (BG_TOP[0], BG_TOP[1], BG_TOP[2], 255),
+                           (BG_BOT[0], BG_BOT[1], BG_BOT[2], 255))
+        panel.putalpha(_rounded_mask(col_w, col_h, radius))
+        img.paste(panel, (col_x, col_top), panel)
+        draw.rounded_rectangle(
+            (col_x, col_top, col_x + col_w - 1, col_bot - 1),
+            radius=radius, outline=BORDER[:3], width=1,
+        )
+        if is_owner:
+            # Gold left-edge bar.
+            bar_w = int(6 * s)
+            draw.rounded_rectangle(
+                (col_x + int(10 * s), col_top + int(28 * s),
+                 col_x + int(10 * s) + bar_w, col_bot - int(28 * s)),
+                radius=int(3 * s), fill=ACCENT[:3],
+            )
+            # YOU pill, top-right.
+            tag = "YOU"
+            tw = draw.textlength(tag, font=f_owner_tag)
+            pill_pad_x = int(14 * s); pill_pad_y = int(8 * s)
+            pill_h = int(40 * sp)
+            pill_x1 = col_x + col_w - int(24 * s)
+            pill_x0 = pill_x1 - int(tw) - 2 * pill_pad_x
+            pill_y0 = col_top + int(24 * s)
+            pill_y1 = pill_y0 + pill_h
+            draw.rounded_rectangle(
+                (pill_x0, pill_y0, pill_x1, pill_y1),
+                radius=pill_h // 2, fill=ACCENT[:3],
+            )
+            tag_h = draw.textbbox((0, 0), tag, font=f_owner_tag)[3]
+            draw.text(
+                (pill_x0 + pill_pad_x, pill_y0 + (pill_h - tag_h) // 2 - 2),
+                tag, font=f_owner_tag, fill=BG_BOT[:3],
+            )
 
-        # Diff vs par
+        cx = col_x + col_w // 2
+
+        _centered(draw, p["name"].upper(), f_name, cx,
+                  col_top + int(col_h * name_y_f), name_color)
+
+        # Big score number — anchor of the panel.
+        _centered(draw, str(b["strokes"]), f_score, cx,
+                  col_top + int(col_h * score_y_f), ACCENT[:3])
+
+        # Diff vs par — soft-red over par, gold under, muted "E".
         diff = b["diff"]
-        diff_str = f"+{diff}" if diff > 0 else (str(diff) if diff < 0 else "E")
-        diff_color = ACCENT[:3] if diff <= 0 else MUTED[:3]
-        y = int(H * 0.60)
-        _centered(draw, f"{diff_str}  ·  par {b['par']}", f_diff, cx, y, diff_color)
+        if diff < 0:
+            diff_str, diff_color = str(diff), UNDER_PAR[:3]
+        elif diff > 0:
+            diff_str, diff_color = f"+{diff}", OVER_PAR[:3]
+        else:
+            diff_str, diff_color = "E", MUTED[:3]
+        _centered(draw, diff_str, f_diff, cx,
+                  col_top + int(col_h * diff_y_f), diff_color)
+        _centered(draw, f"par {b['par']}", f_par, cx,
+                  col_top + int(col_h * par_y_f), MUTED[:3])
 
-        # Stat row labels + values
-        labels = ["BIRDIES", "PARS", "BOGEYS", "DBL+", "PUTTS"]
-        values = [b["birdies"], b["pars"], b["bogeys"], b["doubles_plus"], b["putts"]]
-        # Lay out across the column.
-        slot_w = col_w // len(labels)
-        slot_left = side_margin + col_w * i
-        for j, (lbl, val) in enumerate(zip(labels, values)):
-            sx = slot_left + slot_w * j + slot_w // 2
-            _centered(draw, str(val), f_stat, sx, int(H * 0.78), name_color)
-            _centered(draw, lbl, f_label, sx, int(H * 0.84), MUTED[:3])
+        # Stats row — five slots in one row across the bottom of the panel.
+        stat_pairs = [
+            ("BIRDIES", b["birdies"]),
+            ("PARS",    b["pars"]),
+            ("BOGEYS",  b["bogeys"]),
+            ("DBL+",    b["doubles_plus"]),
+            ("PUTTS",   b["putts"]),
+        ]
+        n_stats = len(stat_pairs)
+        slot_w = col_w // n_stats
+        stats_y = col_top + int(col_h * stats_y_f)
+        for j, (lbl, val) in enumerate(stat_pairs):
+            sx = col_x + slot_w * j + slot_w // 2
+            _centered(draw, str(val), f_stat, sx, stats_y, TEXT[:3])
+            _centered(draw, lbl, f_label, sx,
+                      stats_y + int(col_h * 0.05), MUTED[:3])
 
     return img
 

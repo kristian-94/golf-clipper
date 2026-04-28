@@ -48,6 +48,10 @@ FINAL_PID: dict = {}  # {"pid": int} while encoding, used by /cancel
 # Aggregate status for the "Re-render all clips" batch job — feeds /progress.
 # state: idle|running|done|error. Per-stem state remains in RENDER_STATUS.
 BATCH_STATUS: dict = {"state": "idle"}
+# PIDs of in-flight per-clip ffmpegs spawned by render workers. The
+# /render-all/cancel endpoint SIGTERMs only these — using `pgrep -x ffmpeg`
+# would also kill an unrelated finalise running in parallel.
+RENDER_PIDS: set[int] = set()
 
 
 def _ffmpeg_children_resource() -> dict:
@@ -217,6 +221,10 @@ async def api_clips():
             "render_status": None,
         }
         out.append(data)
+    # Chronological by recorded_at; filename sort breaks across devices
+    # (e.g. Android `20260427_*.mp4` always sorts before iPhone `IMG_*.MOV`).
+    # Sidecars without recorded_at fall back to filename order at the end.
+    out.sort(key=lambda d: (d.get("recorded_at") is None, d.get("recorded_at") or d["stem"]))
     return out
 
 
@@ -326,18 +334,29 @@ def _batch_finished(stem: str, ok: bool, msg: str = "") -> None:
         BATCH_STATUS["errors_list"].append({"stem": stem, "msg": msg})
     done = BATCH_STATUS["completed"] + BATCH_STATUS["errors"]
     if done >= BATCH_STATUS["total"]:
-        BATCH_STATUS["state"] = "error" if BATCH_STATUS["errors"] else "done"
+        if BATCH_STATUS.get("cancel_requested"):
+            BATCH_STATUS["state"] = "cancelled"
+        else:
+            BATCH_STATUS["state"] = "error" if BATCH_STATUS["errors"] else "done"
         BATCH_STATUS["finished_at"] = __import__("time").time()
 
 
 def _render_job(stem: str) -> None:
     """Single-pass trim+overlay+normalize from sidecar. Output matches canvas."""
+    # Cancel-aware: queued workers check the flag before starting their ffmpeg
+    # so a cancel drains the queue without spawning more encodes. In-flight
+    # ffmpegs are killed by the /cancel endpoint via SIGTERM.
+    if BATCH_STATUS.get("cancel_requested"):
+        RENDER_STATUS[stem] = "cancelled"
+        _batch_finished(stem, False, "cancelled")
+        return
     try:
         RENDER_STATUS[stem] = "rendering"
         _batch_started(stem)
         meta_path = STATE["meta"] / f"{stem}.json"
         status = render_from_sidecar(
             meta_path, STATE["raw"], STATE["trims"], STATE["canvas"],
+            pid_set=RENDER_PIDS,
         )
         ok = status == "ok"
         RENDER_STATUS[stem] = "done" if ok else f"error: {status}"
@@ -390,6 +409,29 @@ async def api_render_all():
     return {"queued": len(stems), "stems": stems}
 
 
+@app.post("/api/render-all/cancel")
+async def api_render_all_cancel():
+    """Stop the in-flight render-all batch.
+
+    Sets the cancel flag (queued workers short-circuit before encoding) and
+    SIGTERMs only the ffmpegs spawned by render workers — tracked in
+    RENDER_PIDS — so a concurrent finalise encode isn't taken down with us.
+    """
+    if BATCH_STATUS.get("state") != "running":
+        raise HTTPException(409, "no batch running")
+    BATCH_STATUS["cancel_requested"] = True
+    import os
+    import signal as _signal
+    killed = 0
+    for pid in list(RENDER_PIDS):
+        try:
+            os.kill(pid, _signal.SIGTERM)
+            killed += 1
+        except ProcessLookupError:
+            pass
+    return {"cancelling": True, "killed": killed}
+
+
 @app.get("/api/render-all/status")
 async def api_render_all_status():
     """Aggregate progress for the latest re-render-all run.
@@ -415,9 +457,11 @@ async def api_render_all_status():
         else:
             s["eta_s"] = None
         s.update(_ffmpeg_children_resource())
-    elif state in ("done", "error"):
+    elif state in ("done", "error", "cancelled"):
         s["elapsed_s"] = s.get("finished_at", 0) - s.get("started_at", 0)
-        s["percent"] = 1.0
+        s["percent"] = 1.0 if state != "cancelled" else (
+            (s["completed"] + s["errors"]) / s["total"] if s.get("total") else 0.0
+        )
         s["eta_s"] = 0.0
         s["cpu_percent"] = None
         s["rss_mb"] = None
