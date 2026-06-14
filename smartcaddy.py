@@ -22,8 +22,10 @@ from pathlib import Path
 
 import httpx
 
-DEFAULT_API_BASE = "https://smartcaddy-backend-production.up.railway.app/api"
-APP_VERSION = "2026.4.17"
+# Caddly retired the REST backend; the scorecard now lives behind an MCP
+# server (Streamable HTTP, Bearer PAT auth). Override with SMARTCADDY_MCP_URL.
+MCP_URL = os.environ.get("SMARTCADDY_MCP_URL", "https://api.caddly.golf/mcp")
+APP_VERSION = "2026.5.21"  # Caddly MCP rejects versions older than this (HTTP 426)
 
 
 def load_env(env_path: Path) -> None:
@@ -38,26 +40,110 @@ def load_env(env_path: Path) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def _client(token: str | None) -> httpx.Client:
-    base = os.environ.get("SMARTCADDY_API_BASE", DEFAULT_API_BASE)
-    headers = {"X-App-Version": APP_VERSION, "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return httpx.Client(base_url=base, headers=headers, timeout=15.0)
+def _mcp_result(body: str) -> dict:
+    """Extract the JSON-RPC result from an MCP Streamable-HTTP response.
+
+    Responses come back as Server-Sent Events (`data: {...}` lines); a plain
+    JSON body is tolerated too in case the server stops streaming.
+    """
+    payload = None
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            payload = json.loads(line[5:].lstrip())
+    if payload is None:
+        payload = json.loads(body)
+    if payload.get("error"):
+        raise RuntimeError(f"MCP error: {payload['error']}")
+    return payload["result"]
+
+
+class _Mcp:
+    """A single MCP session: the initialize handshake plus tool calls."""
+
+    def __init__(self, token: str):
+        self._c = httpx.Client(timeout=30.0, headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "X-App-Version": APP_VERSION,
+            "Authorization": f"Bearer {token}",
+        })
+        r = self._c.post(MCP_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "golf-clipper", "version": "1.0"}},
+        })
+        r.raise_for_status()
+        sid = r.headers.get("mcp-session-id")
+        if sid:
+            self._c.headers["mcp-session-id"] = sid
+        self._c.post(MCP_URL, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def tool(self, name: str, arguments: dict | None = None) -> dict:
+        r = self._c.post(MCP_URL, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        })
+        r.raise_for_status()
+        result = _mcp_result(r.text)
+        return json.loads(result["content"][0]["text"])
+
+    def close(self) -> None:
+        self._c.close()
 
 
 def fetch_by_share_token(share_token: str, token: str | None = None) -> dict:
-    with _client(token) as c:
-        r = c.get(f"/rounds/shared/{share_token}")
-        r.raise_for_status()
-        return r.json()
+    raise NotImplementedError(
+        "Caddly retired the share-token REST endpoint. Fetch by --round-id "
+        "against the MCP server instead."
+    )
+
+
+def _scorecard_to_raw(sc: dict, owner_username: str | None) -> dict:
+    """Reshape an MCP get_scorecard payload into the REST-era round shape that
+    normalize() expects (roundHoles + playerSessions)."""
+    pars: dict[int, int] = {}
+    sessions: list[dict] = []
+    for p in sc.get("players", []):
+        name = p.get("name") or "player"
+        is_owner = bool(owner_username) and name.lower() == owner_username.lower()
+        scores = []
+        for h in p.get("holes", []):
+            if h.get("par") is not None:
+                pars.setdefault(h["hole"], h["par"])
+            scores.append({
+                "holeNumber": h["hole"],
+                "strokes": h.get("strokes"),
+                "putts": h.get("putts"),
+                "createdAt": h.get("createdAt"),
+            })
+        sessions.append({
+            "id": name,
+            "isActive": True,
+            "userId": owner_username if is_owner else None,
+            "user": {"username": name},
+            "scores": scores,
+        })
+    return {
+        "id": sc.get("roundId"),
+        "name": sc.get("course"),
+        "shareToken": None,
+        "userId": owner_username,
+        "roundHoles": [{"holeNumber": n, "par": pars[n]} for n in sorted(pars)],
+        "playerSessions": sessions,
+    }
 
 
 def fetch_by_round_id(round_id: str, token: str) -> dict:
-    with _client(token) as c:
-        r = c.get(f"/rounds/{round_id}")
-        r.raise_for_status()
-        return r.json()
+    mcp = _Mcp(token)
+    try:
+        scorecard = mcp.tool("get_scorecard", {"roundId": round_id})
+        try:
+            owner = (mcp.tool("get_player_stats") or {}).get("username")
+        except Exception:
+            owner = None  # owner detection is best-effort; correlation still works
+    finally:
+        mcp.close()
+    return _scorecard_to_raw(scorecard, owner)
 
 
 def _player_name(ps: dict) -> str:
@@ -136,6 +222,28 @@ def fetch_and_save(
         raw = fetch_by_share_token(share_token, token)
     data = normalize(raw)
     out = round_dir / "scores.json"
+    # Preserve user-set fields from the existing file: `assignment_mode` (set
+    # by the gap correlator) and per-player `played_through` (set by the UI
+    # when a partner left mid-round). Re-fetch should refresh strokes from
+    # SmartCaddy without clobbering manual roster overrides.
+    if out.exists():
+        try:
+            existing = json.loads(out.read_text())
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        if "assignment_mode" in existing:
+            data["assignment_mode"] = existing["assignment_mode"]
+        if "players_locked" in existing:
+            data["players_locked"] = existing["players_locked"]
+        if "holes_locked" in existing:
+            data["holes_locked"] = existing["holes_locked"]
+        prior_played: dict[str, int] = {}
+        for p in existing.get("players", []):
+            if "played_through" in p and p.get("played_through") is not None:
+                prior_played[p.get("name")] = p["played_through"]
+        for p in data["players"]:
+            if p["name"] in prior_played:
+                p["played_through"] = prior_played[p["name"]]
     out.write_text(json.dumps(data, indent=2))
     return data
 

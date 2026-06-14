@@ -118,6 +118,7 @@ def render_card(
     shot: tuple[int, int] | None = None,
     hole_map: Image.Image | None = None,
     scale: float = 1.0,
+    active_player: str | None = None,
 ) -> Image.Image:
     """Build a translucent RGBA card. `players` is leaderboard-ordered.
 
@@ -219,6 +220,18 @@ def render_card(
         if i:
             y += row_gap
         name_color = OWNER if p.get("is_owner") else TEXT
+        is_active = active_player is not None and p.get("name") == active_player
+
+        # Highlight the active player — just a thin accent bar to the left
+        # of the row, no background fill. Card stays uniform & opaque.
+        if is_active:
+            row_top = y - px(3)
+            row_bot = y + row_h + px(2)
+            draw.rounded_rectangle(
+                (sb_left + pad_x - px(10), row_top + px(1),
+                 sb_left + pad_x - px(6), row_bot - px(1)),
+                radius=px(2), fill=ACCENT,
+            )
 
         # Name
         draw.text((sb_left + pad_x, y), p["name"],
@@ -256,8 +269,8 @@ def render_card(
 
 # Encode quality for the per-clip render. This is now the ONLY encode in
 # the whole pipeline (concat is byte-copy), so we spend bits here.
-CRF = "12"
-PRESET = "slow"
+CRF = "16"
+PRESET = "medium"
 
 
 def _probe_src_fps(path: Path) -> float | None:
@@ -290,6 +303,7 @@ def render_video(
     canvas: dict,
     card: Image.Image | None = None,
     pid_set: set | None = None,
+    rotate: int = 0,
 ) -> None:
     """Trim raw_path[start..start+duration] → dst, normalised to canvas.
 
@@ -340,12 +354,29 @@ def render_video(
         retime_chain = ""
         audio_extra = ""
 
+    # Optional rotation. Applied BEFORE scale so a 90°-rotated portrait
+    # source is letterboxed correctly into a landscape canvas.
+    #   90  → transpose=1 (90° clockwise)
+    #   180 → transpose=2,transpose=2 (180°)
+    #   270 → transpose=2 (90° counter-clockwise)
+    if rotate == 0:
+        rotate_chain = ""
+    elif rotate == 90:
+        rotate_chain = "transpose=1,"
+    elif rotate == 180:
+        rotate_chain = "transpose=2,transpose=2,"
+    elif rotate == 270:
+        rotate_chain = "transpose=2,"
+    else:
+        raise ValueError(f"rotate must be 0/90/180/270, got {rotate}")
+
     # Build the video filter chain. Lower-res clips are upscaled with Lanczos
     # and letterboxed; lower-fps clips get frame-doubled by the fps filter
     # (no interpolation — visually the clip plays at its source rate inside
     # a higher-fps container, which is what we want).
     base_chain = (
         f"{retime_chain}"
+        f"{rotate_chain}"
         f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
         f"fps={fps_str},setsar=1,format={pix_fmt}"

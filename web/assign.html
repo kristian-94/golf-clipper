@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Review assignments — Golf clipper</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --line: #2a313c;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --strong: #2ea043;
+    --weak: #d1242f;
+    --warn: #d29922;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+               font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 10px 16px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header .meta { color: var(--muted); }
+  header .actions { margin-left: auto; display: flex; gap: 8px; }
+  header a, header button {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 10px; cursor: pointer; font: inherit; text-decoration: none;
+  }
+  header a:hover, header button:hover { border-color: var(--accent); }
+  main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+
+  /* Toolbar (lock toggle + player filter) */
+  #toolbar {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .tb-btn {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 12px; cursor: pointer; font: inherit; font-size: 12px;
+  }
+  .tb-btn:hover { border-color: var(--accent); }
+  .tb-btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .tb-btn.lock { font-weight: 600; padding: 6px 14px; margin-right: 16px; }
+  .tb-btn.lock.active { background: var(--strong); border-color: var(--strong); color: #fff; }
+  .tb-sep {
+    color: var(--muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px;
+  }
+
+  /* Hole sections */
+  .hole-section {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; margin-bottom: 12px; overflow: hidden;
+  }
+  .hole-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    background: rgba(88,166,255,0.05);
+  }
+  .hole-header .h-num { font-size: 16px; font-weight: 700; }
+  .hole-header .h-par { color: var(--muted); }
+  .hole-header .h-strokes {
+    color: var(--accent); font-size: 12px;
+    background: rgba(88,166,255,0.12);
+    padding: 2px 8px; border-radius: 10px;
+  }
+  .hole-header .h-strokes.over {
+    color: var(--warn); background: rgba(210,153,34,0.15);
+  }
+  .unassigned-section .hole-header { background: rgba(210,153,34,0.08); }
+
+  /* Clip rows */
+  .clip-row {
+    display: grid;
+    grid-template-columns: 200px 1fr auto auto auto;
+    gap: 12px; align-items: center;
+    padding: 8px 14px; border-bottom: 1px solid var(--line);
+  }
+  .clip-row:last-child { border-bottom: 0; }
+  .clip-row:hover { background: rgba(255,255,255,0.02); }
+
+  .clip-thumb {
+    width: 200px; aspect-ratio: 16/9;
+    background: #000; border-radius: 4px; overflow: hidden;
+    cursor: pointer;
+  }
+  .clip-thumb video, .clip-thumb .ph {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .clip-thumb .ph {
+    color: var(--muted); font-size: 11px;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .clip-info { min-width: 0; }
+  .clip-info .stem { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .clip-info .stem-name { font-weight: 600; }
+  .clip-info .ts { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
+  .clip-info .shot-readout,
+  .clip-info .hole-readout {
+    color: var(--accent); font-size: 11px; font-weight: 600;
+    background: rgba(88,166,255,0.12); padding: 1px 6px; border-radius: 3px;
+  }
+  .clip-info .hole-readout { color: var(--strong); background: rgba(46,160,67,0.12); }
+
+  .clip-row select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 8px; font: inherit; min-width: 60px;
+  }
+  .clip-row label { color: var(--muted); font-size: 11px; margin-right: 4px; }
+
+  .review-chip {
+    font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .review-chip.unreviewed { background: rgba(110,118,129,0.15); color: var(--muted); }
+  .review-chip.needs_fix  { background: rgba(209,36,47,0.15); color: var(--weak); }
+  .review-chip.approved   { background: rgba(46,160,67,0.15); color: var(--strong); }
+  .review-chip.player-chip { background: rgba(88,166,255,0.2); color: var(--accent); }
+
+  /* Lightbox — clicking a thumb expands the trim into a big inline player
+     instead of jumping to the compare view. Esc or backdrop click closes. */
+  .lightbox {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,0.85);
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 12px;
+  }
+  .lightbox video {
+    max-width: 90vw; max-height: 85vh;
+    background: #000; border-radius: 6px;
+  }
+  .lightbox-edit {
+    color: var(--text); text-decoration: none;
+    background: var(--accent); color: var(--bg);
+    padding: 8px 16px; border-radius: 6px;
+    font-size: 13px; font-weight: 600;
+  }
+  .lightbox-edit:hover { background: #79b8ff; }
+
+  .players-panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 14px; margin-bottom: 12px;
+  }
+  .players-panel h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted); margin: 0 0 8px;
+  }
+  .player-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 4px 0;
+  }
+  .player-row .name { font-weight: 600; min-width: 100px; }
+  .player-row .name .owner {
+    font-size: 10px; color: var(--accent); margin-left: 6px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .player-row label { color: var(--muted); font-size: 12px; }
+  .player-row select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 8px; font: inherit;
+  }
+
+  .empty { color: var(--muted); padding: 32px; text-align: center; }
+  .saving { color: var(--accent); font-size: 12px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Review assignments</h1>
+    <span class="meta" id="round-meta">…</span>
+    <div class="actions">
+      <span class="saving" id="saving"></span>
+      <a href="/">← Back to grid</a>
+    </div>
+  </header>
+  <main>
+    <div id="toolbar"></div>
+    <div id="players-panel"></div>
+    <div id="sections"></div>
+    <div class="empty" id="empty" style="display:none">Nothing to review.</div>
+  </main>
+
+  <div id="lightbox" class="lightbox" style="display:none;">
+    <video id="lightbox-video" controls autoplay loop playsinline></video>
+    <a id="lightbox-edit" class="lightbox-edit" href="#">Open editor →</a>
+  </div>
+
+<script>
+// State -----------------------------------------------------------------
+let SCORES = null;                 // raw scores.json
+let CLIPS = [];                    // /api/clips response
+const STROKES = {};                // player -> {hole: strokes}
+let HOLES = [];                    // [{number, par}]
+let LOCKED = false;                // players_locked: hide player+shot dropdowns, derive shot from chrono
+let HOLES_LOCKED = false;          // holes_locked: hide hole dropdown too — clips are read-only
+let PLAYER_FILTER = null;          // null = show all; otherwise filter by player name
+let LAST_SIG = "";                 // skip re-render when nothing visible changed
+let savePending = 0;
+const VIDEO_CACHE = new Map();     // stem -> reused <video> element
+
+// DOM helpers -----------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, ...children) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k === "style") node.style.cssText = v;
+    else if (k.startsWith("on")) node[k] = v;
+    else if (v != null) node.setAttribute(k, v);
+  }
+  for (const c of children.flat()) {
+    if (c == null || c === false) continue;
+    node.append(c.nodeType ? c : document.createTextNode(c));
+  }
+  return node;
+};
+
+const ownerName = () => SCORES?.players.find(p => p.is_owner)?.name;
+const playerOf = (c) => c.player || ownerName();
+const strokesFor = (player, hole) => (STROKES[player] || {})[hole];
+
+// Load ------------------------------------------------------------------
+async function load() {
+  const [round, scores, clips] = await Promise.all([
+    fetch("/api/round").then(r => r.json()),
+    fetch("/api/scores").then(r => r.ok ? r.json() : null),
+    fetch("/api/clips").then(r => r.json()),
+  ]);
+  if (!scores) {
+    $("sections").innerHTML = `<div class="empty">No scorecard for this round.</div>`;
+    return;
+  }
+  SCORES = scores; CLIPS = clips;
+  LOCKED = !!round.players_locked;
+  HOLES_LOCKED = !!round.holes_locked;
+  HOLES = scores.holes.map(h => ({ number: h.number, par: h.par }));
+  for (const p of scores.players) {
+    STROKES[p.name] = {};
+    for (const s of (p.scores || [])) {
+      if (s.strokes != null) STROKES[p.name][s.hole] = s.strokes;
+    }
+  }
+  let label = `${round.round} — ${round.raw_count} clips`;
+  if (round.course) label += `  •  ${round.course}`;
+  $("round-meta").textContent = label;
+  render();
+}
+
+// Toolbar ---------------------------------------------------------------
+function renderToolbar() {
+  const root = $("toolbar");
+  root.innerHTML = "";
+  const mk = (label, active, onclick) => el("button", {
+    class: "tb-btn" + (active ? " active" : ""),
+    onclick,
+  }, label);
+
+  // Stage 1 — players lock. Hide it once it's locked AND holes are locked
+  // so the toolbar isn't cluttered when everything's settled.
+  const playersLockBtn = el("button", {
+    class: "tb-btn lock" + (LOCKED ? " active" : ""),
+    title: LOCKED
+      ? "Unlock to edit player + shot per clip again."
+      : "Lock once every clip's player is correct. Auto-derives shot indexes by chrono order.",
+    onclick: () => toggleLock("players", !LOCKED),
+  }, LOCKED ? "🔒 Players locked" : "🔓 Lock players");
+  root.appendChild(playersLockBtn);
+
+  // Stage 2 — holes lock. Only shown after players are locked. Drilling
+  // down: players first, then holes, then we're done.
+  if (LOCKED) {
+    const holesLockBtn = el("button", {
+      class: "tb-btn lock" + (HOLES_LOCKED ? " active" : ""),
+      title: HOLES_LOCKED
+        ? "Unlock to edit holes again."
+        : "Lock once every clip is on the right hole. Rows become read-only review.",
+      onclick: () => toggleLock("holes", !HOLES_LOCKED),
+    }, HOLES_LOCKED ? "🔒 Holes locked" : "🔓 Lock holes");
+    root.appendChild(holesLockBtn);
+  }
+
+  // Bulk attribution — one-tap "every clip is this golfer" for single-phone
+  // rounds. Hidden once players are locked (attribution is settled by then).
+  if (!LOCKED && SCORES.players.length > 1) {
+    root.appendChild(el("span", { class: "tb-sep" }, "All shots →"));
+    for (const p of SCORES.players) {
+      root.appendChild(el("button", {
+        class: "tb-btn",
+        title: `Attribute every clip in the round to ${p.name}`,
+        onclick: () => assignAllPlayer(p.name),
+      }, p.name + (p.is_owner ? " (me)" : "")));
+    }
+  }
+
+  if (SCORES.players.length > 1) {
+    root.appendChild(el("span", { class: "tb-sep" }, "Show:"));
+    root.appendChild(mk("All", PLAYER_FILTER === null, () => { PLAYER_FILTER = null; LAST_SIG = ""; render(); }));
+    for (const p of SCORES.players) {
+      root.appendChild(mk(p.name + (p.is_owner ? " (me)" : ""),
+        PLAYER_FILTER === p.name,
+        () => { PLAYER_FILTER = p.name; LAST_SIG = ""; render(); }));
+    }
+  }
+}
+
+async function toggleLock(which, locked) {
+  savePending++;
+  setSaving(true);
+  try {
+    const r = await fetch(`/api/${which}/locked`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ locked }),
+    });
+    if (!r.ok) { alert(`Lock failed: ${r.status}`); return; }
+    const result = await r.json();
+    if (which === "players") LOCKED = result.locked;
+    else HOLES_LOCKED = result.locked;
+    if (result.renumbered?.length) {
+      flashSaving(`auto-numbered ${result.renumbered.length} clip${result.renumbered.length === 1 ? "" : "s"}`);
+    }
+    CLIPS = await fetch("/api/clips").then(r => r.json());
+    LAST_SIG = "";
+    render();
+  } finally { savePending--; if (savePending === 0) setSaving(false); }
+}
+
+async function assignAllPlayer(name) {
+  if (!confirm(`Set ALL clips in this round to ${name}? This overwrites every per-clip player tag.`)) return;
+  savePending++;
+  setSaving(true);
+  try {
+    const r = await fetch(`/api/players/assign-all`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ player: name }),
+    });
+    if (!r.ok) { alert(`Failed: ${r.status} ${await r.text()}`); return; }
+    const res = await r.json();
+    flashSaving(`set ${res.changed} clip${res.changed === 1 ? "" : "s"} → ${name}`);
+    CLIPS = await fetch("/api/clips").then(r => r.json());
+    LAST_SIG = "";
+    render();
+  } finally { savePending--; if (savePending === 0) setSaving(false); }
+}
+
+// Players panel — only shown when there's more than one player ----------
+function renderPlayersPanel() {
+  const root = $("players-panel");
+  if (!SCORES || SCORES.players.length < 2) { root.innerHTML = ""; return; }
+  if (root.dataset.rendered === "1") return;  // dropdowns must keep focus
+  root.dataset.rendered = "1";
+
+  const inner = el("div", { class: "players-panel" },
+    el("h3", {}, `Roster — set "played through" if a partner left mid-round`));
+  for (const p of SCORES.players) {
+    const opts = [el("option", { value: "" }, "all 18")];
+    for (let h = 1; h <= 18; h++) {
+      opts.push(el("option", {
+        value: h, ...(h === p.played_through ? { selected: "" } : {}),
+      }, `through hole ${h}`));
+    }
+    const sel = el("select", {
+      onchange: (ev) => savePlayedThrough(p.name, ev.target.value === "" ? null : parseInt(ev.target.value, 10)),
+    }, opts);
+    inner.appendChild(el("div", { class: "player-row" },
+      el("span", { class: "name" },
+        p.name,
+        p.is_owner ? el("span", { class: "owner" }, "you") : null),
+      el("label", {}, "played"),
+      sel,
+    ));
+  }
+  root.innerHTML = "";
+  root.appendChild(inner);
+}
+
+async function savePlayedThrough(name, value) {
+  savePending++;
+  setSaving(true);
+  try {
+    const r = await fetch(`/api/players/${encodeURIComponent(name)}/played-through`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ played_through: value }),
+    });
+    if (!r.ok) { alert(`Failed: ${r.status} ${await r.text()}`); return; }
+    SCORES = await fetch("/api/scores").then(r => r.json());
+    CLIPS = await fetch("/api/clips").then(r => r.json());
+    LAST_SIG = "";
+    render();
+  } finally { savePending--; if (savePending === 0) setSaving(false); }
+}
+
+// Render ----------------------------------------------------------------
+function clipsSig(clips) {
+  return clips.map(c =>
+    `${c.stem}|${c.hole}|${c.shot_index}|${c.shot_total}|${c.has_trim}|${c.review}|${c.player || ""}`
+  ).join(";");
+}
+
+function render() {
+  renderToolbar();
+  renderPlayersPanel();
+
+  const sig = clipsSig(CLIPS) + `|f=${PLAYER_FILTER || ""}|l=${LOCKED ? 1 : 0}`;
+  if (sig === LAST_SIG) return;
+  LAST_SIG = sig;
+
+  const scrollY = window.scrollY;
+  const root = $("sections");
+  root.innerHTML = "";
+
+  const passes = PLAYER_FILTER ? (c => playerOf(c) === PLAYER_FILTER) : (() => true);
+
+  const unassigned = CLIPS
+    .filter(c => c.hole == null && passes(c))
+    .sort(byRecordedAt);
+  if (unassigned.length) root.appendChild(renderSection({
+    heading: "Unassigned", clips: unassigned, hole: null,
+  }));
+
+  for (const h of HOLES) {
+    const cs = CLIPS.filter(c => c.hole === h.number && passes(c)).sort(byRecordedAt);
+    if (!cs.length) continue;
+    root.appendChild(renderSection({
+      heading: `Hole ${h.number}`, par: h.par, clips: cs, hole: h.number,
+    }));
+  }
+
+  $("empty").style.display = root.children.length ? "none" : "";
+  requestAnimationFrame(() => window.scrollTo(0, scrollY));
+}
+
+function byRecordedAt(a, b) {
+  // Split sub-clips inherit recorded_at from the parent — tiebreak by
+  // impact_s (strike moment within the raw) so they sort in real order.
+  const cmp = (a.recorded_at || a.stem).localeCompare(b.recorded_at || b.stem);
+  if (cmp !== 0) return cmp;
+  return (a.impact_s || 0) - (b.impact_s || 0);
+}
+
+function renderSection({ heading, par, clips, hole }) {
+  // Per-player breakdown: how many clips vs. that player's strokes for the
+  // hole. Only flagged when clips > strokes (genuinely too many).
+  const breakdown = [];
+  if (hole != null) {
+    const byPlayer = new Map();
+    for (const c of clips) {
+      const p = playerOf(c);
+      byPlayer.set(p, (byPlayer.get(p) || 0) + 1);
+    }
+    // Stable order: scorecard order, only players with clips here.
+    for (const p of SCORES.players) {
+      const count = byPlayer.get(p.name);
+      if (!count) continue;
+      const strokes = strokesFor(p.name, hole);
+      breakdown.push({ name: p.name, count, strokes });
+    }
+  }
+
+  const headerKids = [el("span", { class: "h-num" }, heading)];
+  if (par != null) headerKids.push(el("span", { class: "h-par" }, `par ${par}`));
+  for (const b of breakdown) {
+    const cls = "h-strokes" + (b.strokes != null && b.count > b.strokes ? " over" : "");
+    const txt = b.strokes != null
+      ? `${b.name}: ${b.count}/${b.strokes}`
+      : `${b.name}: ${b.count}`;
+    headerKids.push(el("span", { class: cls }, txt));
+  }
+
+  return el("section", { class: "hole-section" + (hole == null ? " unassigned-section" : "") },
+    el("div", { class: "hole-header" }, headerKids),
+    ...clips.map(c => renderClipRow(c, hole)),
+  );
+}
+
+function renderClipRow(c, hole) {
+  const ts = c.recorded_at
+    ? new Date(c.recorded_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true })
+    : "–";
+  const player = playerOf(c);
+  const isNonOwner = c.player && c.player !== ownerName();
+
+  // Thumbnail — reuse video element across renders so metadata stays loaded.
+  const thumb = el("div", {
+    class: "clip-thumb",
+    title: "Click to play larger; ⇧-click for editor",
+    onclick: (ev) => {
+      if (!c.has_trim) return;
+      if (ev.shiftKey) location.href = `/clip/${encodeURIComponent(c.stem)}`;
+      else openLightbox(c.stem);
+    },
+  });
+  if (c.has_trim) {
+    let v = VIDEO_CACHE.get(c.stem);
+    if (!v) {
+      v = el("video", {
+        src: `/trims/${encodeURIComponent(c.stem)}.mp4`,
+        muted: "", loop: "", playsinline: "",
+        preload: "metadata",
+        onmouseenter: () => v.play().catch(() => {}),
+        onmouseleave: () => v.pause(),
+      });
+      VIDEO_CACHE.set(c.stem, v);
+    }
+    thumb.appendChild(v);
+  } else {
+    thumb.appendChild(el("div", { class: "ph" }, "no trim"));
+  }
+
+  // Info column.
+  const infoBits = [
+    el("span", { class: "stem-name" }, c.stem),
+    el("span", { class: `review-chip ${c.review || "unreviewed"}` }, c.review || "unreviewed"),
+  ];
+  if (isNonOwner) infoBits.push(el("span", { class: "review-chip player-chip" }, c.player));
+
+  // Read-only badges that appear in the info row when fields are locked.
+  // Shot stays editable via the dropdown even after locking, so no readout.
+  const tsKids = [ts];
+  if (HOLES_LOCKED && c.hole != null) {
+    tsKids.push(el("span", { class: "hole-readout" }, `hole ${c.hole}`));
+  }
+  const info = el("div", { class: "clip-info" },
+    el("div", { class: "stem" }, infoBits),
+    el("div", { class: "ts" }, tsKids),
+  );
+
+  const kids = [thumb, info];
+
+  // Hole dropdown — hidden when holes are locked.
+  if (!HOLES_LOCKED) {
+    const holeSel = el("select", {
+      onchange: (ev) => save(c.stem, { hole: parseInt(ev.target.value, 10) }),
+    }, HOLES.map(h => el("option", {
+      value: h.number, ...(h.number === c.hole ? { selected: "" } : {}),
+    }, h.number)));
+    if (c.hole == null) {
+      holeSel.prepend(el("option", { value: "", selected: "", disabled: "" }, "—"));
+    }
+    kids.push(el("div", {}, el("label", {}, "hole"), holeSel));
+  }
+
+  // Shot dropdown — stays editable even after locking, so manual fixes
+  // are still possible at the end. Auto-derive on lock just sets a baseline.
+  if (c.hole != null) {
+    const strokes = strokesFor(player, c.hole);
+    const max = Math.max(strokes || 0, c.shot_total || 0, 10);
+    const shotOpts = [];
+    for (let i = 1; i <= max; i++) {
+      shotOpts.push(el("option", {
+        value: i, ...(i === c.shot_index ? { selected: "" } : {}),
+      }, `${i} / ${strokes || c.shot_total || max}`));
+    }
+    const shotSel = el("select", {
+      onchange: (ev) => save(c.stem, {
+        shot_index: parseInt(ev.target.value, 10),
+        shot_total: strokes || c.shot_total || parseInt(ev.target.value, 10),
+      }),
+    }, shotOpts);
+    kids.push(el("div", {}, el("label", {}, "shot"), shotSel));
+  }
+
+  // Player dropdown — hidden once the players lock is on.
+  if (!LOCKED && SCORES.players.length > 1) {
+    const playerSel = el("select", {
+      onchange: (ev) => save(c.stem, { player: ev.target.value }),
+    }, SCORES.players.map(p => el("option", {
+      value: p.name, ...(p.name === c.player ? { selected: "" } : {}),
+    }, p.name + (p.is_owner ? " (me)" : ""))));
+    kids.push(el("div", {}, el("label", {}, "player"), playerSel));
+  }
+
+  return el("div", { class: "clip-row" }, ...kids);
+}
+
+// Save ------------------------------------------------------------------
+function setSaving(active) { $("saving").textContent = active ? "Saving…" : ""; }
+function flashSaving(msg) {
+  $("saving").textContent = msg;
+  setTimeout(() => { if ($("saving").textContent === msg) $("saving").textContent = ""; }, 1800);
+}
+
+async function save(stem, body) {
+  savePending++;
+  setSaving(true);
+  try {
+    const r = await fetch(`/api/clips/${encodeURIComponent(stem)}/assign`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { alert(`Save failed: ${r.status} ${await r.text()}`); return; }
+    const updated = await r.json();
+    const i = CLIPS.findIndex(c => c.stem === stem);
+    if (i >= 0) CLIPS[i] = updated;
+
+    // Apply server-side cascade/renumber side-effects so the next render
+    // reflects them without a full /api/clips refetch. Side-change rows
+    // can include a hole move too (when locked-mode cascade fires).
+    let cascadeCount = 0;
+    for (const ch of (updated.side_changes || [])) {
+      const j = CLIPS.findIndex(c => c.stem === ch.stem);
+      if (j < 0) continue;
+      if (ch.hole != null && ch.hole !== CLIPS[j].hole) {
+        CLIPS[j].hole = ch.hole;
+        cascadeCount++;
+      }
+      CLIPS[j].shot_index = ch.shot_index;
+      CLIPS[j].shot_total = ch.shot_total;
+    }
+    if (cascadeCount) flashSaving(`cascaded ${cascadeCount} clip${cascadeCount === 1 ? "" : "s"} forward`);
+    if (!LOCKED && updated.hole != null) {
+      // Unlocked mode: still dedup within hole by chrono so two clips can't
+      // share a shot index. Locked mode already does this server-side.
+      const cr = await fetch(`/api/clips/${encodeURIComponent(stem)}/renumber`, { method: "POST" });
+      if (cr.ok) {
+        const { updated: changes } = await cr.json();
+        for (const ch of changes) {
+          const j = CLIPS.findIndex(c => c.stem === ch.stem);
+          if (j >= 0) {
+            CLIPS[j].shot_index = ch.shot_index;
+            CLIPS[j].shot_total = ch.shot_total;
+          }
+        }
+      }
+    }
+    render();
+  } finally { savePending--; if (savePending === 0) setSaving(false); }
+}
+
+// Lightbox --------------------------------------------------------------
+function openLightbox(stem) {
+  const lb = $("lightbox");
+  const v = $("lightbox-video");
+  v.src = `/trims/${encodeURIComponent(stem)}.mp4`;
+  $("lightbox-edit").href = `/clip/${encodeURIComponent(stem)}`;
+  lb.style.display = "flex";
+}
+function closeLightbox() {
+  const lb = $("lightbox");
+  const v = $("lightbox-video");
+  v.pause();
+  v.removeAttribute("src");
+  v.load();
+  lb.style.display = "none";
+}
+$("lightbox").onclick = (ev) => {
+  // Close when clicking the backdrop, but not the video or the edit link.
+  if (ev.target.id === "lightbox") closeLightbox();
+};
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && $("lightbox").style.display !== "none") closeLightbox();
+});
+
+// Status widget (shared) ------------------------------------------------
+{
+  const sw = document.createElement("script");
+  sw.src = "/web/status-widget.js";
+  document.body.appendChild(sw);
+}
+
+// Boot + poll -----------------------------------------------------------
+load();
+setInterval(async () => {
+  if (savePending > 0) return;
+  try {
+    const fresh = await fetch("/api/clips").then(r => r.json());
+    CLIPS = fresh;
+    render();
+  } catch {}
+}, 3000);
+</script>
+</body>
+</html>

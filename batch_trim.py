@@ -42,7 +42,7 @@ import json
 import subprocess
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from course_map import extract_gps, load_course_geom, render_hole_map
@@ -82,20 +82,50 @@ def list_videos(raw_dir: Path) -> list[Path]:
     )
 
 
+def _to_utc_z(raw: str) -> str:
+    """Normalize an ISO-8601 timestamp (possibly with a tz offset) to UTC with
+    a trailing Z and microseconds — the format every other `recorded_at` uses,
+    so the string-sorted chronology stays correct. Returns the input unchanged
+    if it can't be parsed."""
+    raw = raw.strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
 def probe_recorded_at(src: Path) -> str | None:
-    """Return ISO-8601 creation_time from container metadata, or None.
+    """Return the clip's true capture time as ISO-8601 UTC (…Z), or None.
+
+    Prefers Apple's `com.apple.quicktime.creationdate` — it carries the
+    original capture instant *and* its timezone. iPhones reset the track-level
+    `creation_time` to the transfer time when a clip is AirDropped or
+    downloaded from another device, so for those clips `creation_time` is when
+    it landed on this phone, not when it was filmed. We fall back to
+    `creation_time` when the QuickTime tag is absent (e.g. Android clips).
 
     Used downstream to correlate the clip with a SmartCaddy hole boundary.
     Missing on screen-recorded or metadata-stripped files — caller should flag.
     """
     out = subprocess.run(
         ["ffprobe", "-v", "error",
-         "-show_entries", "format_tags=creation_time",
-         "-of", "default=nw=1:nk=1", str(src)],
+         "-show_entries",
+         "format_tags=com.apple.quicktime.creationdate,creation_time",
+         "-of", "default=noprint_wrappers=1", str(src)],
         capture_output=True, text=True,
     )
-    val = out.stdout.strip()
-    return val or None
+    tags: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("TAG:") and "=" in line:
+            k, _, v = line[4:].partition("=")
+            if v.strip():
+                tags[k.strip()] = v.strip()
+    val = tags.get("com.apple.quicktime.creationdate") or tags.get("creation_time")
+    return _to_utc_z(val) if val else None
 
 
 def ensure_recorded_at(meta_dir: Path, raw_dir: Path) -> int:
@@ -227,6 +257,7 @@ def _card_for(data: dict, course_geom: dict | None = None, scale: float = 1.0):
     return render_card(
         data["hole"], data["par"], data["players"],
         shot=shot, hole_map=hole_map, scale=scale,
+        active_player=data.get("player"),
     )
 
 
@@ -236,6 +267,7 @@ def render_from_sidecar(
     trims_dir: Path,
     canvas: dict | None = None,
     pid_set: set | None = None,
+    with_overlay: bool = True,
 ) -> str:
     """Render the trim from sidecar data, baking in the scorecard if present.
 
@@ -244,6 +276,11 @@ def render_from_sidecar(
     `finalise.py`. If `canvas` is None we compute it from `raw_dir` — but
     callers in a loop should compute it once and pass it in (otherwise we
     re-probe every clip on every render).
+
+    Pass `with_overlay=False` to skip the scorecard composite — useful for
+    the initial preview pass (faster encode, just confirms the trim window).
+    The sidecar's `has_overlay` flag records what the on-disk trim contains
+    so an approve can decide whether a re-render is needed.
 
     Returns "ok" / "no-impact" / "no-raw".
     """
@@ -260,17 +297,40 @@ def render_from_sidecar(
     dst = trims_dir / f"{meta_path.stem}.mp4"
     start = max(0.0, data["impact_s"] - data["pre"])
     duration = data["pre"] + data["post"]
-    # Round dir is the meta dir's parent; course geom is optional.
-    course_geom = load_course_geom(meta_path.parent.parent)
-    # Card layout was tuned at 1080p. Scale every pixel-space dimension by
-    # canvas_h/1080 so the card stays the same physical fraction at 4K.
-    card_scale = max(1.0, canvas["height"] / 1080.0)
+    card = None
+    if with_overlay:
+        # Round dir is the meta dir's parent; course geom is optional.
+        course_geom = load_course_geom(meta_path.parent.parent)
+        # Card layout was tuned at 1080p. Scale every pixel-space dimension
+        # by canvas_h/1080 so the card stays the same fraction at 4K.
+        card_scale = max(1.0, canvas["height"] / 1080.0)
+        card = _card_for(data, course_geom=course_geom, scale=card_scale)
     render_video(src, start, duration, dst,
                  canvas=canvas,
-                 card=_card_for(data, course_geom=course_geom, scale=card_scale),
-                 pid_set=pid_set)
-    data["trimmed_at"] = datetime.now().isoformat(timespec="seconds")
-    meta_path.write_text(json.dumps(data, indent=2))
+                 card=card,
+                 pid_set=pid_set,
+                 rotate=int(data.get("rotate", 0) or 0))
+    # Race-safe write-back: re-read the sidecar in case it was modified
+    # while ffmpeg ran (cascade renumber, manual edit, player change…).
+    # We only own `trimmed_at` and `has_overlay` — everything else stays
+    # at whatever's currently on disk so we don't clobber user edits.
+    # `has_overlay` is true only when the on-disk hole/shot/player still
+    # match what we rendered against — otherwise leave it False so the
+    # render queue will pick this clip up again.
+    on_disk = json.loads(meta_path.read_text())
+    rendered_against = (
+        data.get("hole"), data.get("shot_index"),
+        data.get("shot_total"), data.get("player"),
+        data.get("impact_s"), data.get("rotate"),
+    )
+    current = (
+        on_disk.get("hole"), on_disk.get("shot_index"),
+        on_disk.get("shot_total"), on_disk.get("player"),
+        on_disk.get("impact_s"), on_disk.get("rotate"),
+    )
+    on_disk["trimmed_at"] = datetime.now().isoformat(timespec="seconds")
+    on_disk["has_overlay"] = (card is not None) and rendered_against == current
+    meta_path.write_text(json.dumps(on_disk, indent=2))
     return "ok"
 
 

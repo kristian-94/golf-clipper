@@ -76,6 +76,23 @@
     display: flex; align-items: center; justify-content: center;
     color: var(--muted); font-size: 12px;
   }
+  /* Tiles show the trim's first frame as a poster (preload=metadata) so the
+     grid isn't all black. A small ▶ glyph hints that hover plays it. */
+  .tile .slot { position: relative; }
+  .tile .slot::after {
+    content: "▶";
+    position: absolute; top: 8px; right: 8px;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: rgba(0,0,0,0.55); color: rgba(255,255,255,0.85);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; pointer-events: none;
+    transition: opacity 0.1s;
+  }
+  .tile:hover .slot::after { opacity: 0; }
+  .tile:has(.placeholder) .slot::after { display: none; }
+  /* Tiles already mark "needs fix" with the ✕ badge top-right — hide the
+     play glyph there so it doesn't sit on top of it. */
+  .tile.needs_fix .slot::after { display: none; }
   .tile .meta {
     padding: 8px 10px;
     display: flex; align-items: center; gap: 8px;
@@ -165,6 +182,13 @@
               title="Clips you've signed off on. Hidden from Active.">Approved</button>
       <button class="filter-btn" data-filter="all"
               title="Every clip in the round, regardless of review state.">All</button>
+      <a id="assign-link" href="/assign" class="filter-btn"
+         title="Review and adjust which hole/shot each clip belongs to. Use this when the scorecard was entered after the round and clips were auto-assigned by stroke count."
+         style="display:none;text-decoration:none;">Review assignments</a>
+      <button id="check-dupes" class="filter-btn"
+              title="Find sub-clips on the same raw whose strike moments are within 4 seconds of each other — likely an accidental double-click of the split button.">
+        Check duplicate splits
+      </button>
       <button id="approve-all" class="filter-btn" style="background:var(--accent);color:#0e1116;border-color:var(--accent);font-weight:600;">Approve N unmarked</button>
       <button id="render-all" class="filter-btn"
               title="Rebuild every per-clip trim from its raw source — re-cuts the strike window and re-bakes the scorecard / hole-map overlay. Use this after changes to overlay.py or scorecard data. Doesn't touch the final video."
@@ -177,6 +201,17 @@
     <div class="grid" id="grid"></div>
     <div class="empty" id="empty" style="display:none">No clips match.</div>
   </main>
+
+  <div class="modal-mask" id="dupes-modal">
+    <div class="modal">
+      <h2>Possible duplicate splits</h2>
+      <div class="sub">Sub-clips on the same raw whose strike moments are within 4 seconds — likely a double-click of "+ Add shot at playhead". Open each one to verify, then discard if it's a dupe.</div>
+      <div id="dupes-body" style="max-height:60vh;overflow-y:auto;"></div>
+      <div class="actions">
+        <button id="dupes-close" class="primary">Close</button>
+      </div>
+    </div>
+  </div>
 
   <div class="modal-mask" id="finalise-modal">
     <div class="modal">
@@ -200,15 +235,37 @@
 const TILES = new Map();   // stem -> {el, slot, meta, sig}
 let FILTER = "active";
 
-// Pause off-screen videos to keep the UI smooth.
-const visibility = new IntersectionObserver((entries) => {
+// Lazy preview loading. 80 4K trims can't all `preload="metadata"` at once —
+// the browser caps at ~6 concurrent connections per host, so the back-half
+// of the grid starves and tiles go black. We only attach src on tiles that
+// are visible (plus a small rootMargin for tiles about to scroll in), and
+// detach when they leave the viewport. Hover plays, leave pauses.
+const VIDEO_OBSERVER = new IntersectionObserver((entries) => {
   for (const e of entries) {
-    const v = e.target.querySelector("video");
-    if (!v) continue;
-    if (e.isIntersecting) { v.play().catch(() => {}); }
-    else                  { v.pause(); }
+    const v = e.target;
+    if (e.isIntersecting) {
+      if (!v.src && v.dataset.src) {
+        v.src = v.dataset.src;
+        // Browser fetches metadata + the first frame, displays it as the
+        // tile's poster. No active decoder until hover.
+      }
+    } else {
+      v.pause();
+      if (v.src) {
+        v.removeAttribute("src");
+        v.load();  // free the decoder/buffer
+      }
+    }
   }
-}, { rootMargin: "200px" });
+}, { rootMargin: "200px" });  // pre-load tiles within 200px of the viewport
+
+function attachHover(tile) {
+  const v = tile.querySelector("video");
+  if (!v) return;
+  tile.onmouseenter = () => { v.play().catch(() => {}); };
+  tile.onmouseleave = () => { v.pause(); };
+  VIDEO_OBSERVER.observe(v);
+}
 
 function sigOf(c) {
   return [
@@ -240,7 +297,6 @@ function makeTile(c) {
   const slot = document.createElement("div"); slot.className = "slot";
   const meta = document.createElement("div"); meta.className = "meta";
   tile.appendChild(slot); tile.appendChild(meta);
-  visibility.observe(tile);
   return { el: tile, slot, meta };
 }
 
@@ -266,14 +322,12 @@ function fillTile(rec, c) {
   if (c.has_trim && !hasVideo) {
     rec.slot.innerHTML = "";
     const v = document.createElement("video");
-    v.src = `/trims/${encodeURIComponent(c.stem)}.mp4`;
+    // src attached lazily by VIDEO_OBSERVER when the tile scrolls into view.
+    v.dataset.src = `/trims/${encodeURIComponent(c.stem)}.mp4`;
     v.loop = true; v.muted = true; v.playsInline = true;
     v.preload = "metadata";
     rec.slot.appendChild(v);
-    // Kick visibility check immediately (might already be on screen).
-    if (rec.el.getBoundingClientRect().top < window.innerHeight + 200) {
-      v.play().catch(() => {});
-    }
+    attachHover(rec.el);
   } else if (!c.has_trim && !hasVideo) {
     rec.slot.innerHTML = "";
     const ph = document.createElement("div");
@@ -354,7 +408,6 @@ function render(clips) {
   // Remove tiles no longer wanted.
   for (const [stem, rec] of TILES) {
     if (!wantStems.has(stem)) {
-      visibility.unobserve(rec.el);
       rec.el.remove(); TILES.delete(stem);
     }
   }
@@ -389,6 +442,12 @@ async function load() {
     label += `  •  ${round.course} (${(round.players || []).join(", ")})`;
   }
   document.getElementById("round-meta").textContent = label;
+  // Show the "Review assignments" entry point whenever we're in manual-
+  // scorecard mode, OR when at least one clip still carries the auto-assign
+  // warning — both indicate the user has assignments to verify.
+  const needsReview = round.assignment_mode === "gaps"
+    || clips.some(c => c.correlate_warning);
+  document.getElementById("assign-link").style.display = needsReview ? "" : "none";
   LAST_CLIPS = clips;
   render(clips);
 }
@@ -547,7 +606,62 @@ document.getElementById("approve-all").onclick = async () => {
   LAST_CLIPS = fresh; render(fresh); updateApproveButton();
 };
 
+document.getElementById("check-dupes").onclick = async () => {
+  const groups = await fetch("/api/duplicate-splits?gap=4").then(r => r.json());
+  const body = document.getElementById("dupes-body");
+  body.innerHTML = "";
+  if (!groups.length) {
+    body.innerHTML = `<div style="padding:16px;color:var(--muted);">No duplicate splits found. ✓</div>`;
+  } else {
+    for (const g of groups) {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "padding:10px 0;border-bottom:1px solid var(--line);";
+      const head = document.createElement("div");
+      head.style.cssText = "color:var(--muted);font-size:11px;margin-bottom:6px;";
+      head.textContent = `${g.raw} — closest gap ${g.min_gap_s.toFixed(2)}s`;
+      wrap.appendChild(head);
+      for (const c of g.clips) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:10px;padding:4px 0;";
+        const link = document.createElement("a");
+        link.href = `/clip/${encodeURIComponent(c.stem)}`;
+        link.textContent = c.stem;
+        link.style.cssText = "color:var(--accent);font-family:ui-monospace,Menlo,monospace;flex:1;";
+        const ts = document.createElement("span");
+        ts.style.cssText = "color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:12px;";
+        ts.textContent = `${c.impact_s.toFixed(2)}s`;
+        const review = document.createElement("span");
+        review.className = "chip " + ({approved:"strong", needs_fix:"weak", unreviewed:"pending"}[c.review] || "pending");
+        review.textContent = c.review;
+        const trash = document.createElement("button");
+        trash.className = "filter-btn"; trash.textContent = "Discard";
+        trash.style.cssText = "background:transparent;color:var(--weak);border-color:var(--weak);";
+        trash.onclick = async () => {
+          if (!confirm(`Discard ${c.stem}? Files move to clips/<round>/trash/.`)) return;
+          await fetch(`/api/clips/${encodeURIComponent(c.stem)}/discard`, { method: "POST" });
+          row.remove();
+        };
+        row.append(link, ts, review, trash);
+        wrap.appendChild(row);
+      }
+      body.appendChild(wrap);
+    }
+  }
+  document.getElementById("dupes-modal").classList.add("open");
+};
+document.getElementById("dupes-close").onclick = () =>
+  document.getElementById("dupes-modal").classList.remove("open");
+document.getElementById("dupes-modal").onclick = (e) => {
+  if (e.target.id === "dupes-modal")
+    document.getElementById("dupes-modal").classList.remove("open");
+};
+
 load().then(() => { updateApproveButton(); refreshFinalStatus(); });
+
+// Live render-queue + machine load widget (shared across pages).
+const sw = document.createElement("script");
+sw.src = "/web/status-widget.js";
+document.body.appendChild(sw);
 setInterval(async () => {
   const fresh = await fetch("/api/clips").then(r => r.json());
   LAST_CLIPS = fresh;

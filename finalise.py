@@ -156,10 +156,10 @@ def pick_canvas(infos: list[StreamInfo]) -> dict:
     Always landscape-oriented (YouTube-first): width = max longer side,
     height = max shorter side. Framerate is the highest seen.
 
-    Color handling is pass-through: if any clip is HDR (HLG/BT.2020/10-bit)
-    we output 10-bit `yuv420p10le` with `high10` profile and stamp the
-    output as HLG (`bt2020 / arib-std-b67 / bt2020nc`). Otherwise BT.709
-    SDR. We don't tonemap — the HLG metadata travels through to the file
+    Color handling is pass-through: if the MAJORITY of clips are HDR
+    (HLG/BT.2020/10-bit) we output 10-bit `yuv420p10le` with `high10` profile
+    and stamp the output as HLG (`bt2020 / arib-std-b67 / bt2020nc`).
+    Otherwise BT.709 SDR. We don't tonemap — the HLG metadata travels through
     so HDR-aware players (QuickTime, Photos, iMovie, modern browsers,
     YouTube) display the round at full brightness, and naive players
     still decode the luma roughly correctly.
@@ -175,23 +175,29 @@ def pick_canvas(infos: list[StreamInfo]) -> dict:
         fps_str, fps_val = "60/1", 60.0
     else:
         fps_str, fps_val = fps_pick.fps_str, fps_pick.fps
-    any_hdr = any(i.is_hdr() for i in infos)
-    if any_hdr:
-        color = {
-            "pix_fmt": "yuv420p10le",
-            "profile": "high10",
-            "primaries": "bt2020",
-            "transfer": "arib-std-b67",
-            "matrix": "bt2020nc",
-        }
+    # Canvas regime follows the MAJORITY of clips, not "any". A single HDR
+    # clip — e.g. a borrowed phone's HLG video dropped into an otherwise-SDR
+    # round — must not flip the whole canvas to HDR, which would mislabel
+    # every SDR clip. Ties fall to SDR (safer on naive players). Minority-
+    # regime clips pass through without tonemapping (see is_hdr's note: the
+    # SDR tonemaps available here look worse than pass-through).
+    hdr_count = sum(1 for i in infos if i.is_hdr())
+    majority_hdr = hdr_count * 2 > len(infos)
+    # Bit depth is a SEPARATE axis from color regime. It follows the deepest
+    # source: encoding 8-bit content into a 10-bit canvas is lossless, and it
+    # lets a single 10-bit outlier clip concat alongside 8-bit clips without
+    # forcing every one of them to be re-encoded down. (Color *regime* stays a
+    # majority decision so the outlier doesn't drag everyone into its gamut.)
+    ten_bit = any("10" in (i.pix_fmt or "") for i in infos)
+    depth = {
+        "pix_fmt": "yuv420p10le" if ten_bit else "yuv420p",
+        "profile": "high10" if ten_bit else "high",
+    }
+    if majority_hdr:
+        regime = {"primaries": "bt2020", "transfer": "arib-std-b67", "matrix": "bt2020nc"}
     else:
-        color = {
-            "pix_fmt": "yuv420p",
-            "profile": "high",
-            "primaries": "bt709",
-            "transfer": "bt709",
-            "matrix": "bt709",
-        }
+        regime = {"primaries": "bt709", "transfer": "bt709", "matrix": "bt709"}
+    color = {**depth, **regime}
     return {
         "width": width,
         "height": height,
@@ -305,7 +311,6 @@ def render_title_card(
 
     s = H / 1080.0
     f_eyebrow = _font(int(28 * s), bold=True)
-    f_course = _font(int(140 * s), bold=True)
     f_date = _font(int(42 * s), bold=False)
     f_players_label = _font(int(22 * s), bold=True)
     f_players = _font(int(48 * s), bold=True)
@@ -318,8 +323,20 @@ def render_title_card(
     _centered(draw, "ROUND HIGHLIGHTS", f_eyebrow, W // 2, int(H * 0.22),
               ACCENT[:3])
 
-    # Course name — the hero. Slight letter-spacing emulated by uppercasing
-    # and using a heavy weight; PIL doesn't expose tracking directly.
+    # Course name — the hero. 140pt is the design size; shrink to fit if a
+    # long course name (e.g. "CANTERBURY PUBLIC GOLF COURSE") would overflow
+    # 90% of the canvas. PIL's textlength scales linearly with font size, so
+    # one measurement is enough to estimate the right size.
+    base_course_pt = int(140 * s)
+    max_course_w = int(W * 0.90)
+    f_probe = _font(base_course_pt, bold=True)
+    probe_w = draw.textlength(course_text, font=f_probe)
+    if probe_w > max_course_w:
+        scale = max_course_w / probe_w
+        course_pt = max(int(40 * s), int(base_course_pt * scale))
+    else:
+        course_pt = base_course_pt
+    f_course = _font(course_pt, bold=True)
     _centered(draw, course_text, f_course, W // 2, int(H * 0.40), TEXT[:3])
 
     # Gold rule + date stamp.
@@ -472,7 +489,13 @@ def render_scorecard_card(canvas: dict, scores: dict | None) -> Image.Image:
         y += row_h
         name_color = OWNER[:3] if p.get("is_owner") else TEXT[:3]
         cell(p["name"], f_label, table_left, y, label_col_w, row_h, name_color)
-        strokes_by_hole = {sc["hole"]: sc.get("strokes") for sc in p["scores"]}
+        # Strip out scores past played_through — SmartCaddy fills skipped holes
+        # with strokes=1/putts=1 sentinels, not nulls.
+        played_through = p.get("played_through")
+        strokes_by_hole = {
+            sc["hole"]: sc.get("strokes") for sc in p["scores"]
+            if played_through is None or sc["hole"] <= played_through
+        }
         total = 0
         for i, hole in enumerate(holes):
             v = strokes_by_hole.get(hole["number"])
@@ -544,14 +567,20 @@ def _player_breakdown(player: dict, holes: list[dict]) -> dict:
     """Per-player aggregates over an 18-hole round.
 
     Returns: strokes, par, diff, putts, birdies, pars, bogeys, doubles_plus.
-    Holes the player didn't score are skipped (no penalty).
+    Holes the player didn't score are skipped (no penalty). Holes past their
+    `played_through` cutoff are treated the same way — SmartCaddy fills
+    skipped holes with strokes=1/putts=1 sentinels rather than nulls, which
+    would otherwise count as nine phantom birdies.
     """
     pars = {h["number"]: h["par"] for h in holes}
+    played_through = player.get("played_through")
     strokes = putts = par_total = 0
     birdies = par_count = bogeys = doubles_plus = 0
     for sc in player["scores"]:
         s = sc.get("strokes")
         if s is None:
+            continue
+        if played_through is not None and sc["hole"] > played_through:
             continue
         p = pars.get(sc["hole"])
         if p is None:
@@ -686,6 +715,15 @@ def render_summary_card(canvas: dict, scores: dict | None) -> Image.Image:
 
         _centered(draw, p["name"].upper(), f_name, cx,
                   col_top + int(col_h * name_y_f), name_color)
+
+        # Partial-round tag for players who left early — without it, a 9-hole
+        # 50 looks like an 18-hole 50 at a glance.
+        played_through = p.get("played_through")
+        if played_through is not None and played_through < len(holes):
+            _centered(
+                draw, f"({played_through} HOLES)", f_label, cx,
+                col_top + int(col_h * (name_y_f + 0.06)), MUTED[:3],
+            )
 
         # Big score number — anchor of the panel.
         _centered(draw, str(b["strokes"]), f_score, cx,

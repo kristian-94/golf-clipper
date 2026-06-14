@@ -116,6 +116,65 @@ def _slugify(name: str) -> str:
     return re.sub(r"[\s_-]+", "-", s) or "unknown-course"
 
 
+def _ring(elem: dict) -> list[tuple[float, float]]:
+    """(lon, lat) ring of an OSM way's geometry."""
+    return [(n["lon"], n["lat"]) for n in elem.get("geometry", [])]
+
+
+def _centroid(elem: dict) -> tuple[float, float]:
+    g = elem["geometry"]
+    return (sum(p["lon"] for p in g) / len(g), sum(p["lat"] for p in g) / len(g))
+
+
+def _point_in_ring(lon: float, lat: float, ring: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon. `ring` is a list of (lon, lat)."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def isolate_to_course(geom: dict, seed_lat: float, seed_lon: float) -> dict | None:
+    """Clip a multi-course Overpass result to the one course the seed sits in.
+
+    A radius search near clustered courses (e.g. Georges River / Bankstown /
+    Liverpool) returns every course's holes, with colliding `ref` numbers, so
+    `_hole_features` would draw two courses at once. We keep only the single
+    `leisure=golf_course` boundary polygon that contains the GPS seed plus the
+    golf features inside it.
+
+    Returns the clipped geom, or None when the seed isn't cleanly inside exactly
+    one mappable boundary — in which case the caller renders no map at all
+    rather than guess (the "only if the whole course is clean" rule).
+    """
+    boundaries = [
+        e for e in geom.get("elements", [])
+        if e.get("tags", {}).get("leisure") == "golf_course"
+        and e.get("type") == "way" and len(e.get("geometry", [])) >= 3
+    ]
+    containing = [b for b in boundaries if _point_in_ring(seed_lon, seed_lat, _ring(b))]
+    if len(containing) != 1:
+        return None  # outside every boundary, or inside overlapping ones
+    course = containing[0]
+    ring = _ring(course)
+    kept = [course]
+    for e in geom["elements"]:
+        if e is course or e.get("type") != "way" or not e.get("geometry"):
+            continue
+        if not e.get("tags", {}).get("golf"):
+            continue
+        lon, lat = _centroid(e)
+        if _point_in_ring(lon, lat, ring):
+            kept.append(e)
+    return {**geom, "elements": kept}
+
+
 def fetch_course_geom(round_dir: Path, seed_lat: float, seed_lon: float,
                       force: bool = False) -> dict | None:
     """Fetch OSM golf features near (seed_lat, seed_lon).
@@ -149,6 +208,13 @@ def fetch_course_geom(round_dir: Path, seed_lat: float, seed_lon: float,
             continue
     if data is None:
         print(f"[course_map] all Overpass mirrors failed: {last_err}")
+        return None
+
+    # Clip to the single course the GPS sits in. If we can't isolate one
+    # cleanly, render no map rather than a multi-course mess.
+    data = isolate_to_course(data, seed_lat, seed_lon)
+    if data is None:
+        print("[course_map] GPS not cleanly inside one course boundary — skipping map")
         return None
 
     name = _course_name(data) or f"course-{seed_lat:.4f}-{seed_lon:.4f}"

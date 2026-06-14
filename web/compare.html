@@ -80,6 +80,7 @@
   .ticks {
     position: absolute; left: 0; right: 0; bottom: -22px;
     font-size: 10px; color: var(--muted);
+    pointer-events: none;
   }
   .tick { position: absolute; transform: translateX(-50%); }
 
@@ -94,6 +95,29 @@
 
   .reasons { color: var(--weak); font-size: 12px; margin-top: 8px; }
   .reasons li { margin-left: 16px; }
+
+  .siblings {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .siblings .label {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .sib-chip {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px;
+    padding: 3px 10px; font-size: 12px;
+    text-decoration: none; cursor: pointer;
+  }
+  .sib-chip:hover { border-color: var(--accent); }
+  .sib-chip.current { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .sib-chip .ts { font-family: ui-monospace, Menlo, monospace; opacity: 0.7; margin-left: 4px; }
+  .split-btn {
+    background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit;
+  }
+  .split-btn:hover { background: var(--accent); color: var(--bg); }
 </style>
 </head>
 <body>
@@ -115,6 +139,7 @@
     </div>
 
     <div class="controls">
+      <div class="siblings" id="siblings"></div>
       <div class="timeline-wrap">
         <div class="timeline" id="tl" title="Click to place strike here">
           <div class="window" id="win"></div>
@@ -128,7 +153,16 @@
         <span><label>window</label><span class="v" id="rWin">—</span></span>
         <div class="actions">
           <button id="markHere">Set strike at playhead (space)</button>
-          <button id="save" style="background:#2ea043;">Save & next</button>
+          <button id="splitHere" class="split-btn"
+                  title="Add a NEW shot in this raw video at the current playhead. Stays on this page so you can keep marking more shots.">
+            + Add shot at playhead
+          </button>
+          <button id="rotate" class="ghost"
+                  title="Rotate the trim 90° clockwise. Click again to step through 180°, 270°, and back to upright.">
+            Rotate ⟳
+          </button>
+          <button id="save" style="background:#2ea043;">Save</button>
+          <button id="next" class="ghost" title="Jump to the next clip that still needs review.">Next →</button>
           <button id="discard" style="background:var(--weak);">Discard</button>
         </div>
       </div>
@@ -167,6 +201,32 @@ async function load() {
 
   if (META.render_status && META.render_status !== "done") {
     $("status").textContent = META.render_status;
+  }
+
+  updateRotateLabel();
+  await renderSiblings();
+}
+
+async function renderSiblings() {
+  // Show all clips that share this raw (the original + any sub-clips). Lets
+  // the user hop between sub-clips of the same multi-shot raw without
+  // detouring through the grid.
+  const all = await fetch("/api/clips").then(r => r.json());
+  const sibs = all.filter(c => c.raw === META.raw);
+  const root = $("siblings");
+  root.innerHTML = "";
+  if (sibs.length <= 1) return;  // only the current clip — no list to show
+  const label = document.createElement("span");
+  label.className = "label"; label.textContent = `Shots in ${META.raw}:`;
+  root.appendChild(label);
+  sibs.sort((a, b) => (a.impact_s ?? 0) - (b.impact_s ?? 0));
+  for (const s of sibs) {
+    const chip = document.createElement("a");
+    chip.className = "sib-chip" + (s.stem === STEM ? " current" : "");
+    chip.href = `/clip/${encodeURIComponent(s.stem)}`;
+    const t = (s.impact_s ?? 0).toFixed(2);
+    chip.innerHTML = `${s.stem}<span class="ts">${t}s</span>`;
+    root.appendChild(chip);
   }
 }
 
@@ -257,24 +317,137 @@ $("discard").onclick = async () => {
   gotoNext();
 };
 
+function updateRotateLabel() {
+  const cur = META?.rotate || 0;
+  $("rotate").textContent = cur === 0 ? "Rotate ⟳" : `Rotated ${cur}° ⟳`;
+}
+
+$("rotate").onclick = async () => {
+  const cur = META.rotate || 0;
+  const next = (cur + 90) % 360;  // 0 → 90 → 180 → 270 → 0
+  $("rotate").disabled = true;
+  $("status").textContent = "rotating + re-rendering…";
+  try {
+    const r = await fetch(`/api/clips/${encodeURIComponent(STEM)}/rotate`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ rotate: next }),
+    });
+    if (!r.ok) {
+      alert(`Rotate failed: ${r.status} ${await r.text()}`);
+      return;
+    }
+    META = await r.json();
+    updateRotateLabel();
+    // Bust the trim cache so the rotated render replaces the cached one.
+    if (META.has_trim) {
+      trimV.src = `/trims/${encodeURIComponent(STEM)}.mp4?t=${Date.now()}`;
+    }
+  } finally {
+    $("rotate").disabled = false;
+  }
+};
+
+$("splitHere").onclick = async () => {
+  const at = rawV.currentTime;
+  if (at <= 0 || at >= DURATION) {
+    alert("Scrub to the new strike moment first.");
+    return;
+  }
+  $("splitHere").disabled = true;
+  try {
+    const r = await fetch(`/api/clips/${encodeURIComponent(STEM)}/split`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ impact_s: at }),
+    });
+    if (!r.ok) {
+      alert(`Split failed: ${r.status} ${await r.text()}`);
+      return;
+    }
+    // Stay on the current clip — refresh the siblings chip strip so the new
+    // sub-clip shows up. The user can keep scrubbing and adding more shots.
+    await renderSiblings();
+  } finally {
+    $("splitHere").disabled = false;
+  }
+};
+
 $("save").onclick = async () => {
   $("save").disabled = true;
-  // Save the new impact, kick render in background, mark approved, go.
-  await fetch(`/api/clips/${encodeURIComponent(STEM)}`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ impact_s: META.impact_s, pre: META.pre, post: META.post }),
-  });
-  // Fire-and-forget — server runs ffmpeg on its thread pool.
-  fetch(`/api/clips/${encodeURIComponent(STEM)}/render`, { method: "POST" });
-  await fetch(`/api/clips/${encodeURIComponent(STEM)}/review`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ review: "approved" }),
-  });
-  gotoNext();
+  try {
+    // Save the new impact, kick render in background, mark approved.
+    await fetch(`/api/clips/${encodeURIComponent(STEM)}`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ impact_s: META.impact_s, pre: META.pre, post: META.post }),
+    });
+    fetch(`/api/clips/${encodeURIComponent(STEM)}/render`, { method: "POST" });
+    await fetch(`/api/clips/${encodeURIComponent(STEM)}/review`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ review: "approved" }),
+    });
+
+    // Also approve every sibling sub-clip on the same raw that's still
+    // sitting in unreviewed/needs_fix. Splitting set their impact moments
+    // already — saving the parent is the user's "ship all of them" signal,
+    // so they shouldn't have to walk through each chip individually.
+    const all = await fetch("/api/clips").then(r => r.json());
+    const sibs = all.filter(c =>
+      c.raw === META.raw &&
+      c.stem !== STEM &&
+      (c.review || "unreviewed") !== "approved"
+    );
+    for (const s of sibs) {
+      await fetch(`/api/clips/${encodeURIComponent(s.stem)}/review`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ review: "approved" }),
+      });
+    }
+
+    const extra = sibs.length ? ` (+${sibs.length} sibling${sibs.length > 1 ? "s" : ""})` : "";
+    $("status").textContent = `saved — re-rendering${extra}`;
+    setTimeout(async () => {
+      trimV.src = `/trims/${encodeURIComponent(STEM)}.mp4?t=${Date.now()}`;
+      $("status").textContent = "approved" + extra;
+      await renderSiblings();
+    }, 1500);
+  } finally {
+    $("save").disabled = false;
+  }
 };
+
+$("next").onclick = () => gotoNext();
 
 window.addEventListener("resize", () => { TL_RECT = null; });
 load();
+{
+  const sw = document.createElement("script");
+  sw.src = "/web/status-widget.js";
+  document.body.appendChild(sw);
+}
+
+// Poll render status — when this clip's queued re-render finishes, swap the
+// trim preview to the freshly-rendered file. The render queue can be deep
+// (1 worker × 30+ pending), so without this the user sees stale trims even
+// after the file on disk has been updated.
+let LAST_TRIMMED_AT = null;
+let LAST_RENDER_STATUS = null;
+setInterval(async () => {
+  try {
+    const fresh = await fetch(`/api/clips/${encodeURIComponent(STEM)}`).then(r => r.json());
+    const trimmedAt = fresh.trimmed_at || null;
+    const status = fresh.render_status || null;
+    const doneFlip = LAST_RENDER_STATUS && LAST_RENDER_STATUS !== "done" && status === "done";
+    const trimChanged = LAST_TRIMMED_AT && trimmedAt && trimmedAt !== LAST_TRIMMED_AT;
+    if (doneFlip || trimChanged) {
+      trimV.src = `/trims/${encodeURIComponent(STEM)}.mp4?t=${Date.now()}`;
+      $("status").textContent = "rendered ✓";
+      setTimeout(() => { if ($("status").textContent === "rendered ✓") $("status").textContent = ""; }, 2000);
+    } else if (status && status !== "done") {
+      $("status").textContent = `rendering — ${status}`;
+    }
+    LAST_TRIMMED_AT = trimmedAt;
+    LAST_RENDER_STATUS = status;
+  } catch {}
+}, 2500);
 </script>
 </body>
 </html>
