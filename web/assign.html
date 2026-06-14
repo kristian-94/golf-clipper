@@ -185,6 +185,7 @@
   </header>
   <main>
     <div id="toolbar"></div>
+    <div id="cameras-panel"></div>
     <div id="players-panel"></div>
     <div id="sections"></div>
     <div class="empty" id="empty" style="display:none">Nothing to review.</div>
@@ -198,6 +199,7 @@
 <script>
 // State -----------------------------------------------------------------
 let SCORES = null;                 // raw scores.json
+let ROUND = null;                  // /api/round response (devices, device_subjects)
 let CLIPS = [];                    // /api/clips response
 const STROKES = {};                // player -> {hole: strokes}
 let HOLES = [];                    // [{number, par}]
@@ -240,7 +242,7 @@ async function load() {
     $("sections").innerHTML = `<div class="empty">No scorecard for this round.</div>`;
     return;
   }
-  SCORES = scores; CLIPS = clips;
+  SCORES = scores; CLIPS = clips; ROUND = round;
   LOCKED = !!round.players_locked;
   HOLES_LOCKED = !!round.holes_locked;
   HOLES = scores.holes.map(h => ({ number: h.number, par: h.par }));
@@ -353,6 +355,59 @@ async function assignAllPlayer(name) {
 }
 
 // Players panel — only shown when there's more than one player ----------
+function renderCamerasPanel() {
+  const root = $("cameras-panel");
+  const devices = (ROUND?.devices || []).filter(d => d.model);
+  // Only relevant when the round was filmed on more than one phone.
+  if (!SCORES || devices.length < 2) { root.innerHTML = ""; return; }
+  if (root.dataset.rendered === "1") return;  // keep dropdown focus across re-renders
+  root.dataset.rendered = "1";
+
+  const map = ROUND.device_subjects || {};
+  const inner = el("div", { class: "players-panel" },
+    el("h3", {}, "Cameras — which player does each phone film?"));
+  for (const d of devices) {
+    const opts = [el("option", { value: "" }, "— not set")];
+    for (const p of SCORES.players) {
+      opts.push(el("option", {
+        value: p.name, ...(map[d.model] === p.name ? { selected: "" } : {}),
+      }, p.name));
+    }
+    const sel = el("select", {
+      "data-model": d.model,
+      onchange: saveDeviceSubjects,
+    }, opts);
+    inner.appendChild(el("div", { class: "player-row" },
+      el("span", { class: "name" }, d.model,
+        el("span", { class: "owner" }, `${d.count} clip${d.count === 1 ? "" : "s"}`)),
+      el("label", {}, "films"),
+      sel,
+    ));
+  }
+  root.innerHTML = "";
+  root.appendChild(inner);
+}
+
+async function saveDeviceSubjects() {
+  const subjects = {};
+  for (const sel of $("cameras-panel").querySelectorAll("select[data-model]")) {
+    subjects[sel.getAttribute("data-model")] = sel.value;
+  }
+  savePending++;
+  setSaving(true);
+  try {
+    const r = await fetch("/api/devices/subjects", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ subjects }),
+    });
+    if (!r.ok) { alert(`Failed: ${r.status} ${await r.text()}`); return; }
+    ROUND = await fetch("/api/round").then(r => r.json());
+    CLIPS = await fetch("/api/clips").then(r => r.json());
+    LAST_SIG = "";
+    render();
+  } finally { savePending--; if (savePending === 0) setSaving(false); }
+}
+
 function renderPlayersPanel() {
   const root = $("players-panel");
   if (!SCORES || SCORES.players.length < 2) { root.innerHTML = ""; return; }
@@ -408,6 +463,7 @@ function clipsSig(clips) {
 
 function render() {
   renderToolbar();
+  renderCamerasPanel();
   renderPlayersPanel();
 
   const sig = clipsSig(CLIPS) + `|f=${PLAYER_FILTER || ""}|l=${LOCKED ? 1 : 0}`;

@@ -128,8 +128,28 @@ def probe_recorded_at(src: Path) -> str | None:
     return _to_utc_z(val) if val else None
 
 
+def probe_device_model(src: Path) -> str | None:
+    """Return the recording device model (e.g. "iPhone 14 Pro Max"), or None.
+
+    Read from Apple's `com.apple.quicktime.model` tag. This is the phone-of-
+    origin signal: in a playgroup where each player films the other, the model
+    string identifies whose phone shot the clip — and therefore which player
+    is its subject (see `device_subjects` in scores.json). Absent on Android /
+    metadata-stripped files.
+    """
+    out = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-show_entries", "format_tags=com.apple.quicktime.model",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
+        capture_output=True, text=True,
+    )
+    val = out.stdout.strip()
+    return val or None
+
+
 def ensure_recorded_at(meta_dir: Path, raw_dir: Path) -> int:
-    """Backfill `recorded_at` and `gps`/`gps_accuracy` on older sidecars.
+    """Backfill `recorded_at`, `gps`/`gps_accuracy` and `device_model` on
+    older sidecars.
 
     Returns the count of sidecars updated. Safe to call repeatedly.
     """
@@ -147,6 +167,13 @@ def ensure_recorded_at(meta_dir: Path, raw_dir: Path) -> int:
                     data["flagged"] = True
                     data.setdefault("reasons", []).append(
                         "no creation_time in container metadata")
+                changed = True
+
+        # device_model field absent (sidecar predates phone-of-origin tagging).
+        if "device_model" not in data:
+            src = raw_dir / data["raw"]
+            if src.exists():
+                data["device_model"] = probe_device_model(src)
                 changed = True
 
         # GPS field absent (sidecar predates the map feature).
@@ -183,12 +210,14 @@ def detect_clip(
     audio = extract_audio(src)
     cands = find_impacts(audio, SR)
     recorded_at = probe_recorded_at(src)
+    device_model = probe_device_model(src)
     gps, gps_acc = extract_gps(src)
 
     if not cands:
         data = {
             "raw": src.name,
             "recorded_at": recorded_at,
+            "device_model": device_model,
             "gps": list(gps) if gps else None,
             "gps_accuracy": gps_acc,
             "impact_s": None,
@@ -216,6 +245,7 @@ def detect_clip(
     data = {
         "raw": src.name,
         "recorded_at": recorded_at,
+        "device_model": device_model,
         "gps": list(gps) if gps else None,
         "gps_accuracy": gps_acc,
         "impact_s": best.time_s,

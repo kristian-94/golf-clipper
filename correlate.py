@@ -381,17 +381,30 @@ def correlate(scores: dict, sidecars: dict[str, dict]) -> dict[str, dict]:
             "players": players_through(scores, h, order=leaderboard_order(scores)),
         }
 
-    # Phase 2: optional shot tally (only if owner's strokes for the hole == clip count)
+    # Phase 2: per-player shot tally. Group a hole's clips by subject player
+    # (sidecar `player`, default owner) and number them only when that player's
+    # clip count equals their stroke count — so a mixed-camera hole numbers each
+    # golfer's shots against their own score, not against the owner's.
     owner = next((p for p in scores["players"] if p.get("is_owner")), None)
-    owner_strokes = (
-        {s["hole"]: s["strokes"] for s in owner["scores"]} if owner else {}
+    owner_name = (
+        owner["name"] if owner
+        else (scores["players"][0]["name"] if scores["players"] else None)
     )
-    by_hole: dict[int, list[tuple[str, datetime]]] = {}
+    strokes_by_player = {
+        p["name"]: {
+            s["hole"]: s["strokes"]
+            for s in p.get("scores", [])
+            if s.get("strokes") is not None
+        }
+        for p in scores["players"]
+    }
+    groups: dict[tuple[int, str], list[tuple[str, datetime]]] = {}
     for stem, h in assigned.items():
+        subject = sidecars[stem].get("player") or owner_name
         ts = sidecars[stem]["recorded_at"]
-        by_hole.setdefault(h, []).append((stem, _parse(ts)))
-    for h, items in by_hole.items():
-        expected = owner_strokes.get(h)
+        groups.setdefault((h, subject), []).append((stem, _parse(ts)))
+    for (h, subject), items in groups.items():
+        expected = strokes_by_player.get(subject, {}).get(h)
         if expected and expected == len(items):
             items.sort(key=lambda x: x[1])
             for i, (stem, _) in enumerate(items, 1):
@@ -414,6 +427,30 @@ def _seed_gps(sidecars: dict[str, dict]) -> tuple[float, float] | None:
     if best is None or best[0] > ACCURACY_THRESHOLD_M:
         return None
     return best[1]
+
+
+def tag_players_from_devices(scores: dict, sidecars: dict[str, dict]) -> int:
+    """Set each clip's subject `player` from its `device_model`, using the
+    `device_subjects` map in scores.json (model → the player that phone films).
+
+    Non-clobbering: only clips with no `player` yet are tagged, so manual
+    re-assignments on the /assign page survive a re-correlate. Returns the
+    number of clips newly tagged. A no-op when no map is configured.
+    """
+    device_subjects = scores.get("device_subjects") or {}
+    if not device_subjects:
+        return 0
+    valid = {p["name"] for p in scores.get("players", [])}
+    n = 0
+    for sc in sidecars.values():
+        if sc.get("player"):
+            continue
+        subject = device_subjects.get(sc.get("device_model"))
+        if subject and subject in valid:
+            sc["player"] = subject
+            sc["player_source"] = "device"
+            n += 1
+    return n
 
 
 def apply_to_sidecars(
@@ -456,6 +493,9 @@ def apply_to_sidecars(
 
     meta_dir = round_dir / "meta"
     sidecars = {p.stem: json.loads(p.read_text()) for p in sorted(meta_dir.glob("*.json"))}
+
+    # Phone-of-origin → subject player (only clips not already tagged).
+    tag_players_from_devices(scores, sidecars)
 
     par_by_hole = {h["number"]: h["par"] for h in scores["holes"]}
 

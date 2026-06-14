@@ -388,7 +388,26 @@ async def api_round():
         info["assignment_mode"] = scores.get("assignment_mode", "timestamps")
         info["players_locked"] = bool(scores.get("players_locked", False))
         info["holes_locked"] = bool(scores.get("holes_locked", False))
+        # Detected cameras + current model→player map for the /assign Cameras panel.
+        info["devices"] = _detected_devices()
+        info["device_subjects"] = scores.get("device_subjects") or {}
     return info
+
+
+def _detected_devices() -> list[dict]:
+    """Distinct `device_model` strings across all sidecars, with clip counts,
+    ordered most-clips-first. Clips with no model are grouped under None."""
+    counts: dict[str | None, int] = {}
+    for meta_path in STATE["meta"].glob("*.json"):
+        try:
+            model = json.loads(meta_path.read_text()).get("device_model")
+        except (json.JSONDecodeError, OSError):
+            continue
+        counts[model] = counts.get(model, 0) + 1
+    return [
+        {"model": model, "count": n}
+        for model, n in sorted(counts.items(), key=lambda kv: -kv[1])
+    ]
 
 
 class LockedUpdate(BaseModel):
@@ -578,6 +597,71 @@ async def api_assign_all_player(update: AssignAllPlayerUpdate):
             _kick_overlay_render(meta_path.stem)
 
     return {"player": update.player, "changed": changed, "renumbered": len(rerank)}
+
+
+class DeviceSubjectsUpdate(BaseModel):
+    # device_model → player name. An empty/blank name unmaps that camera.
+    subjects: dict[str, str]
+
+
+@app.post("/api/devices/subjects")
+async def api_set_device_subjects(update: DeviceSubjectsUpdate):
+    """Set the phone-of-origin → subject-player map and re-tag every clip.
+
+    The Cameras panel calls this once per round: "this phone films Kristian,
+    that one films Simon." Each clip from a mapped camera gets that player
+    (overriding a prior device tag, but leaving manual per-clip overrides
+    alone), then the round is re-correlated so per-player shot indexes
+    recompute, and any approved clip with a now-stale overlay is re-rendered.
+    """
+    if not STATE["scores"].exists():
+        raise HTTPException(404, "no scorecard for this round")
+    scores = json.loads(STATE["scores"].read_text())
+    valid = {p["name"] for p in scores.get("players", [])}
+
+    clean: dict[str, str] = {}
+    for model, name in update.subjects.items():
+        name = (name or "").strip()
+        if not name:
+            continue  # blank → leave this camera unmapped
+        if name not in valid:
+            raise HTTPException(400, f"unknown player: {name!r}")
+        clean[model] = name
+    scores["device_subjects"] = clean
+    STATE["scores"].write_text(json.dumps(scores, indent=2))
+
+    retagged = 0
+    for meta_path in sorted(STATE["meta"].glob("*.json")):
+        data = json.loads(meta_path.read_text())
+        model = data.get("device_model")
+        if not model:
+            continue
+        if data.get("player_source") == "manual":
+            continue  # deliberate per-clip override wins
+        subject = clean.get(model)
+        if subject and data.get("player") != subject:
+            data["player"] = subject
+            data["player_source"] = "device"
+            data["has_overlay"] = False
+            meta_path.write_text(json.dumps(data, indent=2))
+            retagged += 1
+        elif not subject and data.get("player_source") == "device":
+            # camera unmapped — drop the auto tag
+            data.pop("player", None)
+            data.pop("player_source", None)
+            data["has_overlay"] = False
+            meta_path.write_text(json.dumps(data, indent=2))
+            retagged += 1
+
+    # Re-correlate so each player's per-hole shot indexes recompute against
+    # their own clips, then re-render approved clips with a stale overlay.
+    correlate_round(STATE["round"], mode=STATE.get("correlate_mode"), fetch_map=False)
+    for meta_path in sorted(STATE["meta"].glob("*.json")):
+        d = json.loads(meta_path.read_text())
+        if d.get("review") == "approved" and d.get("has_overlay") is False:
+            _kick_overlay_render(meta_path.stem)
+
+    return {"device_subjects": clean, "retagged": retagged}
 
 
 def _owner_name() -> str | None:
@@ -812,8 +896,10 @@ async def api_assign_clip(stem: str, update: AssignUpdate):
             raise HTTPException(400, f"unknown player: {update.player!r}")
         if update.player:
             data["player"] = update.player
+            data["player_source"] = "manual"  # so a Cameras-panel re-tag leaves it alone
         else:
             data.pop("player", None)
+            data.pop("player_source", None)
 
     data["has_overlay"] = False
     meta_path.write_text(json.dumps(data, indent=2))
