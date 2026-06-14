@@ -91,6 +91,15 @@
   .readout label { color: var(--muted); font-size: 12px; }
   .readout .v { font-family: ui-monospace, Menlo, monospace; font-size: 13px;
                 color: var(--text); margin-left: 6px; }
+  .winctl { display: inline-flex; align-items: center; gap: 6px; }
+  .winctl .v { min-width: 38px; text-align: center; margin-left: 0; }
+  .step {
+    width: 26px; height: 26px; padding: 0; line-height: 1;
+    border: 1px solid var(--accent); background: transparent; color: var(--accent);
+    border-radius: 6px; cursor: pointer; font-size: 16px;
+  }
+  .step:hover { background: var(--accent); color: var(--bg); }
+  .step:disabled { opacity: .35; cursor: default; }
   .actions { margin-left: auto; display: flex; gap: 8px; }
 
   .reasons { color: var(--weak); font-size: 12px; margin-top: 8px; }
@@ -151,6 +160,16 @@
       <div class="readout">
         <span><label>strike</label><span class="v" id="rImpact">—</span></span>
         <span><label>window</label><span class="v" id="rWin">—</span></span>
+        <span class="winctl"><label>before</label>
+          <button id="preMinus" class="step" title="0.5s less before the strike">−</button>
+          <span class="v" id="rPre">—</span>
+          <button id="prePlus" class="step" title="0.5s more before the strike">+</button>
+        </span>
+        <span class="winctl"><label>after</label>
+          <button id="postMinus" class="step" title="0.5s less after the strike">−</button>
+          <span class="v" id="rPost">—</span>
+          <button id="postPlus" class="step" title="0.5s more after the strike">+</button>
+        </span>
         <div class="actions">
           <button id="markHere">Set strike at playhead (space)</button>
           <button id="splitHere" class="split-btn"
@@ -255,6 +274,13 @@ function layout() {
   $("imp").style.left = impP + "%";
   $("rImpact").textContent = (META.impact_s ?? 0).toFixed(3) + "s";
   $("rWin").textContent = `${inSec().toFixed(2)} → ${outSec().toFixed(2)}s  (${(META.pre + META.post).toFixed(1)}s)`;
+  $("rPre").textContent  = META.pre.toFixed(1) + "s";
+  $("rPost").textContent = META.post.toFixed(1) + "s";
+  // Disable a stepper once the window already reaches the clip edge.
+  $("prePlus").disabled  = META.pre  >= (META.impact_s ?? 0) - 1e-6;
+  $("postPlus").disabled = META.post >= DURATION - (META.impact_s ?? 0) - 1e-6;
+  $("preMinus").disabled  = META.pre  <= 1e-6;
+  $("postMinus").disabled = META.post <= 1e-6;
 }
 
 function movePlayhead() {
@@ -273,13 +299,31 @@ function drawTicks() {
   }
 }
 
+function clampWindow() {
+  // Keep the chosen pre/post but never let the window run past the clip edges.
+  META.pre  = Math.max(0, Math.min(META.pre,  META.impact_s));
+  META.post = Math.max(0, Math.min(META.post, DURATION - META.impact_s));
+}
+
 function setImpact(t) {
   META.impact_s = Math.max(0, Math.min(DURATION, t));
-  // Pre/post stay at config defaults; clamp window to the clip edges.
-  META.pre  = Math.min(ORIGINAL.pre,  META.impact_s);
-  META.post = Math.min(ORIGINAL.post, DURATION - META.impact_s);
+  clampWindow();
   layout();
 }
+
+const WIN_STEP = 0.5;  // seconds per nudge
+function adjustPre(delta) {
+  META.pre = Math.max(0, Math.min(META.impact_s, (META.pre || 0) + delta));
+  layout();
+}
+function adjustPost(delta) {
+  META.post = Math.max(0, Math.min(DURATION - META.impact_s, (META.post || 0) + delta));
+  layout();
+}
+$("prePlus").onclick   = () => adjustPre(WIN_STEP);
+$("preMinus").onclick  = () => adjustPre(-WIN_STEP);
+$("postPlus").onclick  = () => adjustPost(WIN_STEP);
+$("postMinus").onclick = () => adjustPost(-WIN_STEP);
 
 $("tl").addEventListener("click", (e) => {
   TL_RECT = $("tl").getBoundingClientRect();
